@@ -1931,27 +1931,50 @@ def render_findings(findings: Sequence[Dict[str, Any]], title: str = "合规审�
             st.info(text)
 
 
-def stream_to_ui(gen: Generator[str, None, None], label: str = "🤖 AI 正在生成…") -> Optional[str]:
+def stream_to_ui(gen: Generator[str, None, None], label: str = "🤖 AI 正在生成…",
+                 expect_chars: int = 3000) -> Optional[str]:
     """
-    流式渲染到页面：边收边显示，结束后返回完整文本。
-    出错返回 None（调用方据此决定是否落库）。
+    流式生成并渲染。
+
+    ⚠️ 这里刻意**不用** st.empty() 反复 markdown 刷新。原因：
+        Streamlit 前端在「同一个容器里的 Markdown 结构中途变化」时会抛
+        NotFoundError: Failed to execute 'removeChild' on 'Node'（前端崩溃）。
+        流式过程中很容易出现半截表格 |…|、未闭合的 ``` 代码块、--- 分隔线，
+        一旦结构从 <p> 变成 <table>，React 对账就失败。
+        （st.write_stream 内部同样是 container.markdown() 反复刷新，所以换它也没用。）
+
+    做法：
+        1) 生成过程中只更新进度条（元素结构固定：宽度 + 文本），绝不更新 Markdown；
+        2) 生成结束后**一次性**渲染最终 Markdown；
+        3) 不做任何元素删除（连错误分支也不 empty()，避免 removeChild）。
     """
-    box = st.empty()
-    box.markdown("_%s_" % label + " ▌")
     buf: List[str] = []
+    tag = short(label, 16)
+    bar = st.progress(0.0, text=label)
+    last_tick = time.time()
     try:
         for chunk in gen:
             buf.append(chunk)
-            box.markdown("".join(buf) + " ▌")
+            now = time.time()
+            if now - last_tick >= 0.4:      # 限频，减少前端重绘
+                n = len("".join(buf))
+                bar.progress(min(0.95, n / max(400, expect_chars)),
+                             text="%s · 已生成 %d 字…" % (tag, n))
+                last_tick = now
     except LLMError as exc:
-        box.empty()
+        bar.progress(0.0, text="%s · 调用失败" % tag)
         st.error(str(exc))
         audit(actor="系统", actor_role="SYSTEM", event_type="LLM_ERROR",
               status="error", detail={"error": str(exc)})
         return None
+
     text = "".join(buf).strip()
-    box.markdown(text if text else "_（模型无输出）_")
-    return text
+    bar.progress(1.0, text="%s · 完成（%d 字）" % (tag, count_words(text)))
+    if text:
+        st.markdown(text)                   # 只渲染一次，避免结构中途变化
+    else:
+        st.caption("（模型无输出）")
+    return text or None
 
 
 def run_compliance_check(ps: Dict[str, Any], *, target_key: str, text: str, kind: str,

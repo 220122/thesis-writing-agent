@@ -684,9 +684,12 @@ def part_d():
           "问题" in (rev["prompt"] or "") and ("+" in (rev["user_edit"] or "") or "-" in (rev["user_edit"] or "")))
 
     # ---------- D6 Word 导出按钮存在 ----------
-    check("导出页提供 Word 下载按钮",
-          any("Word" in str(getattr(b, "label", "")) for b in at.download_button),
-          str([getattr(b, "label", "") for b in at.download_button])[:120])
+    try:
+        dl = at.get("download_button")          # AppTest 通用取元素接口
+    except Exception:
+        dl = []
+    labels = [str(getattr(b, "label", "")) for b in dl]
+    check("导出页提供 Word 下载按钮", any("Word" in x for x in labels), str(labels)[:140])
 
 
 # =============================================================================
@@ -696,10 +699,13 @@ def part_d():
 def main():
     print("临时数据目录：%s" % TMP_DIR)
     try:
-        part_a()
-        part_b()
-        part_c()
-        part_d()
+        for name, fn in (("A", part_a), ("B", part_b), ("C", part_c), ("D", part_d)):
+            try:
+                fn()
+            except Exception as exc:      # 单个部分崩了不影响其它部分，且会被记为失败
+                FAILED.append("部分 %s 执行异常" % name)
+                printed = False
+                print("  [FAIL] 部分 %s 执行异常：%s: %s" % (name, type(exc).__name__, exc))
     finally:
         print("\n" + "=" * 78)
         print("自检结果：通过 %d 项，失败 %d 项" % (len(PASSED), len(FAILED)))
