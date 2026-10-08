@@ -3440,7 +3440,10 @@ def build_full_document(ps: Dict[str, Any]) -> str:
             mark = "" if c["status"] == "approved" else "> ⚠️ 本章尚未批准，仅为初稿\n"
             parts.append(mark + c["text"].strip() + "\n")
     if ps.get("references", "").strip():
-        parts.append(ps["references"].strip() + "\n")
+        refs = ps["references"].strip()
+        if lit is not None:
+            refs = lit.normalize_reference_blocks(refs)   # 兼容旧数据：保证每条独占一段
+        parts.append(refs + "\n")
     return "\n".join(parts)
 
 

@@ -692,6 +692,42 @@ def part_d():
     check("导出页提供 Word 下载按钮", any("Word" in x for x in labels), str(labels)[:140])
 
 
+    # ---------- D7 参考文献排版（曾把 8 条文献挤成一大段） ----------
+    import literature as lit_mod2
+    recs = [
+        {"title": "探究计算机科学与技术的发展趋势", "authors": [{"family": "", "given": "", "name": "陈静"}],
+         "year": 2024, "venue": "电子通信与计算机科学", "volume": "6", "issue": "1", "pages": "77-79",
+         "doi": "10.37155/2717-5170-0601-26", "url": "", "type": "J", "source": "测试",
+         "cited_by": 0, "abstract": ""},
+        {"title": "浅析计算机人工智能应用与发展", "authors": [{"family": "", "given": "", "name": "黄立彬"}],
+         "year": 2026, "venue": "电子通信与计算机科学", "volume": "8", "issue": "4", "pages": "139-141",
+         "doi": "10.37155/2717-5170-0804-47", "url": "", "type": "J", "source": "测试",
+         "cited_by": 0, "abstract": ""},
+        {"title": "计算机系统集成的发展趋势探讨", "authors": [{"family": "", "given": "", "name": "王勇"}],
+         "year": 2024, "venue": "电子通信与计算机科学", "volume": "6", "issue": "6", "pages": "22-24",
+         "doi": "10.37155/2717-5170-0606-8", "url": "", "type": "J", "source": "测试",
+         "cited_by": 0, "abstract": ""},
+    ]
+    refs_md = lit_mod2.build_reference_list(recs)
+    check("参考文献条目之间有空行（Markdown 才会分段）", "\n\n[2]" in refs_md, repr(refs_md[:40]))
+    ref_blocks = [b for b in dx.parse_markdown_blocks(refs_md) if b[0] == "ref"]
+    check("每条参考文献被解析为独立段落", len(ref_blocks) == len(recs), "%d 条" % len(ref_blocks))
+
+    old_md = "## 参考文献\n" + "\n".join(
+        "[%d] %s" % (i, lit_mod2.format_reference(r)) for i, r in enumerate(recs, 1))
+    old_blocks = [b for b in dx.parse_markdown_blocks(old_md) if b[0] == "ref"]
+    check("旧数据（单换行）也能正确分段", len(old_blocks) == len(recs), "%d 条" % len(old_blocks))
+    check("normalize_reference_blocks 会补空行",
+          "\n\n[2]" in lit_mod2.normalize_reference_blocks(old_md))
+
+    docx_ref = dx.markdown_to_docx(refs_md, "测试论文", {})
+    ref_xml = zipfile.ZipFile(io.BytesIO(docx_ref)).read("word/document.xml").decode("utf-8")
+    check("Word 里每条文献独立成段", ref_xml.count("[1]") == 1 and ref_xml.count("[2]") == 1
+          and ref_xml.count("[3]") == 1)
+    check("Word 里参考文献带悬挂缩进",
+          "hanging" in ref_xml or "firstLine" in ref_xml)
+
+
 # =============================================================================
 # main
 # =============================================================================

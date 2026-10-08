@@ -110,6 +110,12 @@ def parse_markdown_blocks(md_text: str) -> List[Block]:
             blocks.append(("quote", 0, _strip_inline(" ".join(buf))))
             continue
 
+        # 参考文献条目（[1] [2] …）：必须独占一段，绝不能与上下行合并
+        if re.match(r"^\[\d+\]\s*\S", s):
+            blocks.append(("ref", 0, s))
+            i += 1
+            continue
+
         # 有序 / 无序列表
         m = re.match(r"^\d+[.)]\s+(.*)$", s)
         if m:
@@ -129,7 +135,8 @@ def parse_markdown_blocks(md_text: str) -> List[Block]:
             nxt = lines[i].strip()
             if (not nxt or nxt.startswith("#") or nxt.startswith("```")
                     or nxt.startswith(">") or re.match(r"^[-*+]\s+", nxt)
-                    or re.match(r"^\d+[.)]\s+", nxt) or re.fullmatch(r"[-*_]{3,}", nxt)):
+                    or re.match(r"^\d+[.)]\s+", nxt) or re.fullmatch(r"[-*_]{3,}", nxt)
+                    or re.match(r"^\[\d+\]\s*\S", nxt)):
                 break
             buf.append(nxt)
             i += 1
@@ -204,6 +211,16 @@ def _docx_via_python_docx(md_text: str, title: str, meta: Dict[str, Any]) -> byt
                 r.bold, r.italic = bold, italic
                 if mono:
                     r.font.name = "Consolas"
+        elif kind == "ref":
+            # 参考文献条目：悬挂缩进（续行与首行文字对齐），论文规范排版
+            p = doc.add_paragraph()
+            p.paragraph_format.left_indent = Pt(24)
+            p.paragraph_format.first_line_indent = Pt(-24)
+            for chunk, bold, italic, mono in _split_runs(text):
+                r = p.add_run(chunk)
+                r.bold, r.italic = bold, italic
+                if mono:
+                    r.font.name = "Consolas"
         elif kind == "code":
             p = doc.add_paragraph()
             r = p.add_run(text)
@@ -244,11 +261,13 @@ def _run_fragment(text: str, bold: bool, italic: bool, size_half_pt: int, font: 
 
 
 def _para_xml(text: str, size_half_pt: int = 24, font: str = "宋体", indent: bool = False,
-              align: str = "", bullet: str = "") -> str:
+              hang: bool = False, align: str = "", bullet: str = "") -> str:
     """生成一个段落：自动处理 **粗体** / *斜体* / `等宽` 内联标记。"""
     ppr = ['<w:spacing w:line="360" w:lineRule="auto"/>']
     if indent:
         ppr.append('<w:ind w:firstLineChars="200" w:firstLine="480"/>')
+    if hang:
+        ppr.append('<w:ind w:leftChars="200" w:left="480" w:hangingChars="200" w:hanging="480"/>')
     if align:
         ppr.append('<w:jc w:val="%s"/>' % align)
     parts = []
@@ -289,6 +308,8 @@ def _docx_minimal(md_text: str, title: str, meta: Optional[Dict[str, Any]] = Non
             body.append(_para_xml(text, size_half_pt=24, bullet="• "))
         elif kind == "oli":
             body.append(_para_xml(text, size_half_pt=24))
+        elif kind == "ref":
+            body.append(_para_xml(text, size_half_pt=24, hang=True))
         elif kind == "code":
             for line in text.split("\n"):
                 body.append(_para_xml(line, size_half_pt=20, font="Consolas"))

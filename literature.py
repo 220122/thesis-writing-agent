@@ -510,11 +510,29 @@ def format_reference(rec: Dict[str, Any], style: str = "GB/T 7714-2015（顺序�
 
 def build_reference_list(records: Sequence[Dict[str, Any]],
                          style: str = "GB/T 7714-2015（顺序编码制）") -> str:
-    """生成带 [n] 连续编号的「## 参考文献」章节。"""
+    """
+    生成带 [n] 连续编号的「## 参考文献」章节。
+
+    注意：条目之间用**空行**分隔。Markdown（以及 Word 导出）里连续两行会被合并成同一段，
+    用单换行会把所有文献挤成一大段跑文，必须空行才是独立段落。
+    """
     lines = ["## 参考文献"]
-    for i, rec in enumerate(records, start=1):
-        lines.append("[%d] %s" % (i, format_reference(rec, style)))
-    return "\n".join(lines) + "\n"
+    entries = ["[%d] %s" % (i, format_reference(rec, style))
+               for i, rec in enumerate(records, start=1)]
+    return "\n".join(lines) + "\n\n" + "\n\n".join(entries) + "\n"
+
+
+def normalize_reference_blocks(text: str) -> str:
+    """
+    保证每条参考文献独占一段：给以 [n] 开头的行前面补空行。
+    用于兼容历史数据（早期版本生成的是单换行，会在 Word 里挤成一大段）。
+    """
+    out: List[str] = []
+    for line in (text or "").splitlines():
+        if re.match(r"^\s*\[\d+\]", line) and out and out[-1].strip():
+            out.append("")
+        out.append(line)
+    return "\n".join(out)
 
 
 def has_provenance(rec: Dict[str, Any]) -> bool:
