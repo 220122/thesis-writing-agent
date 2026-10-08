@@ -60,6 +60,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -67,6 +68,12 @@ from datetime import datetime
 from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple
 
 import streamlit as st
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import literature as lit          # 真实文献检索（OpenAlex / Crossref，免费无 Key）
+except Exception:                      # pragma: no cover - 模块缺失时降级为手工录入
+    lit = None
 
 # ---- 尽早加载项目根目录的 .env（若安装了 python-dotenv）----
 #   ① 首次安装脚本会把 DEEPSEEK_API_KEY 写进 .env；
@@ -916,7 +923,12 @@ class RuleEngine:
     # ---------------- 引用交叉核对 ----------------
 
     @staticmethod
-    def check_citations(body_text: str, refs_text: str) -> List[Dict[str, Any]]:
+    def check_citations(body_text: str, refs_text: str, report_uncited: bool = True) -> List[Dict[str, Any]]:
+        """
+        正文引用 ↔ 文献表 交叉核对。
+        report_uncited：只有整篇检查时才报告「文献表有但正文未引用」——
+        单章检查时只引用了文献库的一部分，报这个是误报。
+        """
         findings: List[Dict[str, Any]] = []
         cited = extract_intext_citations(body_text)
         entries = parse_reference_entries(refs_text)
@@ -947,9 +959,9 @@ class RuleEngine:
                 "source": "规则引擎",
             })
 
-        # 文献表 → 正文引用（列而未引）
+        # 文献表 → 正文引用（列而未引）：仅整篇检查时才有意义
         uncited = sorted(n for n in ref_nos if n not in set(cited))
-        if uncited:
+        if uncited and report_uncited:
             findings.append({
                 "level": LEVEL_WARNING, "category": "文献未引用",
                 "message": "参考文献列表中存在未被正文引用的条目：%s。" % ", ".join("[%d]" % n for n in uncited),
@@ -1240,6 +1252,31 @@ class RuleEngine:
             })
         return findings
 
+    # ---------------- 参考文献来源可追溯性 ----------------
+
+    @staticmethod
+    def check_reference_provenance(refs_text: str) -> List[Dict[str, Any]]:
+        """
+        没有 DOI / 原文链接的参考文献无法核验真实性，必须提示人工确认。
+        这是「防编造文献」的最后一道提示：真实文献一律能给出 DOI 或可访问链接。
+        """
+        entries = parse_reference_entries(refs_text)
+        if not entries:
+            return []
+        no_src = [e for e in entries
+                  if not re.search(r"(10\.\d{4,9}/|doi|https?://)", e["text"], re.I)]
+        if not no_src:
+            return []
+        return [{
+            "level": LEVEL_WARNING, "category": "来源不可追溯",
+            "message": "有 %d 条参考文献没有 DOI 或原文链接，系统无法核验其真实性，请逐条确认后再提交。"
+                       % len(no_src),
+            "evidence": "涉及编号：" + "、".join("[%s]" % e["no"] for e in no_src[:8]),
+            "suggestion": "到知网 / 谷歌学术找到原文并补上 DOI 或链接；"
+                          "如发现是编造的文献，请立即删除——编造参考文献属于学术不端。",
+            "source": "规则引擎",
+        }]
+
     # ---------------- 汇总入口 ----------------
 
     @classmethod
@@ -1262,7 +1299,8 @@ class RuleEngine:
 
         if kind in ("chapter", "document", "references"):
             findings += cls.check_references(refs, style)
-            findings += cls.check_citations(body, refs)
+            findings += cls.check_reference_provenance(refs)
+            findings += cls.check_citations(body, refs, report_uncited=(kind == "document"))
             findings += cls.check_citation_density(body, kind, target_name)
             findings += cls.check_similarity(text or "", compare_sources)
             if kind == "chapter" and chapters is not None and chapter is not None:
@@ -1448,6 +1486,11 @@ class ComplianceAgent(BaseAgent):
             "你是一位严格的高校学术合规审查员，负责审查本科毕业论文的学术规范性。\n"
             "审查维度：① 引用与参考文献规范（{style}）② 学术诚信风险（抄袭倾向、数据来源不明、"
             "模糊归因、过度断言）③ 论证与大纲的逻辑一致性 ④ 格式规范。\n"
+            "【严重程度判定的硬性要求——务必遵守】\n"
+            "  [BLOCKER] 只用于**学术诚信与引用真实性**问题：编造或无法核实的引用编号、"
+            "编造数据/文献、疑似抄袭、正文引用了文献表中不存在的文献。\n"
+            "  其它一切问题（论证不充分、逻辑瑕疵、缺少统计检验、术语不统一、格式细节、"
+            "写作质量）一律用 [WARNING] 或 [INFO]，**不得**标为 BLOCKER。\n"
             "输出要求：每一行一个问题，格式严格为：\n"
             "  [BLOCKER] 类别：问题描述 ｜ 证据：原文片段 ｜ 建议：修改建议\n"
             "  [WARNING] 类别：问题描述 ｜ 证据：原文片段 ｜ 建议：修改建议\n"
@@ -1457,15 +1500,18 @@ class ComplianceAgent(BaseAgent):
         )
 
     def llm_review(self, *, text: str, kind: str, style: str, outline_text: str = "",
-                   target_name: str = "") -> Generator[str, None, None]:
+                   target_name: str = "", references: str = "") -> Generator[str, None, None]:
         sys_prompt = self.system_prompt.replace("{style}", style)
         user_prompt = (
             "【审查对象】%s：%s\n【著录格式要求】%s\n\n"
             "【已批准大纲（用于判断逻辑一致性）】\n%s\n\n"
+            "【可核验的参考文献列表（正文引用编号应对应此表；表为空时说明尚未提供文献）】\n%s\n\n"
             "【待审文本】\n%s\n"
             % (
                 "大纲" if kind == "outline" else "章节正文", target_name or "-", style,
                 short(outline_text, 2000) or "（无）",
+                short(references, 6000) or "（本次未提供参考文献列表，请勿据此判定引用造假，"
+                                            "只提示「未提供文献列表，无法核验」即可）",
                 short(text, 12000),
             )
         )
@@ -1524,13 +1570,48 @@ def new_project_state(meta: Dict[str, Any]) -> Dict[str, Any]:
         "project_id": pid,
         "meta": meta,
         "state": ST_INIT,
+        "mode": "hitl",          # hitl = 逐步人工模式；auto = 一键生成模式
         "outline": {"text": "", "version": 0, "status": "empty",
                     "approved_at": "", "approved_by": "", "feedback": ""},
         "chapters": [],
-        "references": "",
-        "reviews": {},          # {"outline": {...}, "chapter_1": {...}, "document": {...}}
-        "history": [],          # 轻量事件流（供概览页展示）
+        "references": "",        # 参考文献 Markdown（喂给大模型的就是它）
+        "ref_records": [],       # 结构化文献库（带 DOI/URL，用于溯源校验与再导出）
+        "reviews": {},           # {"outline": {...}, "chapter_1": {...}, "document": {...}}
+        "history": [],           # 轻量事件流（供概览页展示）
     }
+
+
+def get_ref_records(ps: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """取结构化文献库；若只有文本（用户手工编辑过），则即时解析回结构化。"""
+    recs = ps.get("ref_records")
+    if isinstance(recs, list) and recs:
+        return recs
+    text = ps.get("references") or ""
+    if text.strip() and lit is not None:
+        parsed = lit.parse_reference_text(text)
+        if parsed:
+            ps["ref_records"] = parsed
+            return parsed
+    return []
+
+
+def set_ref_records(ps: Dict[str, Any], records: Sequence[Dict[str, Any]]) -> None:
+    """更新结构化文献库，并同步生成 Markdown 文本（两者的唯一入口，避免不一致）。"""
+    recs = list(records)
+    ps["ref_records"] = recs
+    if recs and lit is not None:
+        style = ps.get("meta", {}).get("citation_style", CITATION_STYLES[0])
+        ps["references"] = lit.build_reference_list(recs, style)
+    elif not recs:
+        ps["references"] = ""
+
+
+def reference_records_block(ps: Dict[str, Any]) -> str:
+    """给大模型看的文献清单（带 [n] 编号，与 ps['references'] 的编号一一对应）。"""
+    recs = get_ref_records(ps)
+    if recs and lit is not None:
+        return lit.records_to_text_block(recs)
+    return ps.get("references", "")
 
 
 def get_review(ps: Dict[str, Any], key: str) -> Optional[Dict[str, Any]]:
@@ -1677,14 +1758,33 @@ def init_session() -> None:
     if SS.get("pstate") is None:
         pid = read_last_pid()
         if pid:
-            ps = load_project_state(pid)
-            if ps:
-                SS["pstate"] = ps
+            loaded = normalize_state(load_project_state(pid))
+            if loaded:
+                SS["pstate"] = loaded
                 SS["active_pid"] = pid
+    else:
+        SS["pstate"] = normalize_state(SS.get("pstate"))
+
+
+def normalize_state(ps: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """兼容旧版本项目存档：补齐后来新增的字段，避免打开老项目时报 KeyError。"""
+    if not isinstance(ps, dict):
+        return None
+    ps.setdefault("mode", "hitl")
+    ps.setdefault("references", "")
+    ps.setdefault("ref_records", [])
+    ps.setdefault("reviews", {})
+    ps.setdefault("history", [])
+    ps.setdefault("chapters", [])
+    ps.setdefault("outline", {"text": "", "version": 0, "status": "empty",
+                              "approved_at": "", "approved_by": "", "feedback": ""})
+    ps.get("meta", {}).setdefault("keywords", "")
+    ps.get("meta", {}).setdefault("year_from", 0)
+    return ps
 
 
 def switch_project(pid: str) -> None:
-    ps = load_project_state(pid)
+    ps = normalize_state(load_project_state(pid))
     if ps:
         SS["pstate"] = ps
         SS["active_pid"] = pid
@@ -1793,7 +1893,8 @@ def run_compliance_check(ps: Dict[str, Any], *, target_key: str, text: str, kind
             agent.llm_review(text=text, kind=kind,
                              style=meta.get("citation_style", CITATION_STYLES[0]),
                              outline_text=outline_ref,
-                             target_name=target_name),
+                             target_name=target_name,
+                             references=ps.get("references", "")),
             label="🛡️ 合规审查员 Agent 审查中…",
         ) or ""
         llm_findings, summary = ComplianceAgent.parse_llm_findings(llm_text)
@@ -1850,6 +1951,10 @@ def render_sidebar() -> None:
                 )
                 student = st.text_input("学生姓名（写入审计日志）", placeholder="选填")
                 advisor = st.text_input("指导教师", placeholder="选填")
+                keywords = st.text_input("文献检索关键词（留空则用论文题目）",
+                                         placeholder="例如：短视频 注意力 大学生")
+                year_from = st.number_input("文献起始年份（0=不限）", min_value=0, max_value=2030,
+                                            value=2018, step=1)
                 submitted = st.form_submit_button("创建项目并进入规划师环节", use_container_width=True)
 
             if submitted:
@@ -1861,6 +1966,7 @@ def render_sidebar() -> None:
                         "target_words": int(target_words), "chapter_count": int(chapter_count),
                         "citation_style": citation_style, "research_type": research_type,
                         "student": student.strip(), "advisor": advisor.strip(),
+                        "keywords": keywords.strip(), "year_from": int(year_from),
                     }
                     ps = new_project_state(meta)
                     SS["pstate"] = ps
@@ -2202,7 +2308,7 @@ def render_writer_tab(ps: Dict[str, Any]) -> None:
             text = stream_to_ui(
                 agent.write_chapter(meta, outline["text"], chapter,
                                     chapter.get("target_words", 1200),
-                                    references=ps.get("references", ""),
+                                    references=reference_records_block(ps),
                                     extra=extra, feedback=feedback),
                 label="✍️ 撰写员 Agent 正在写作第%d章…" % chapter["index"],
             )
@@ -2384,42 +2490,31 @@ def merge_references(old: str, new: str) -> str:
 
 def render_compliance_tab(ps: Dict[str, Any]) -> None:
     st.markdown("### 🛡️ 合规审查员 Agent · 全局合规中心")
-    st.caption("本页提供：① 项目参考文献库维护 ② 全篇格式与结构检查 ③ 全局自查重")
+    st.caption("本页提供：① 真实文献库检索与维护 ② 全篇格式与结构检查 ③ 全局自查重")
 
-    st.markdown("#### ① 项目参考文献库")
-    st.caption("顺序编码制要求正文编号与文献表严格对应。撰写员生成的参考文献会在此自动合并，你可手工校正。")
-    refs = st.text_area("参考文献（Markdown，每条形如 [1] 作者. 题名[J]. 刊名, 年, 卷(期): 页码.）",
-                        value=ps.get("references", ""), height=220, key="global_refs_edit")
-    c1, c2 = st.columns([1, 1])
-    if c1.button("💾 保存参考文献库", use_container_width=True):
-        if refs.strip() != ps.get("references", "").strip():
-            diff = unified_diff(ps.get("references", ""), refs, "项目参考文献库")
-            ps["references"] = refs
-            audit(actor=ps["meta"].get("student") or "用户", actor_role="HUMAN",
-                  event_type="USER_EDIT", stage="references", target="references",
-                  prompt="用户维护参考文献库", user_edit=diff,
-                  status="success",
-                  detail={"entries": len(parse_reference_entries(refs))})
-            persist(ps)
-            st.success("已保存，共 %d 条。" % len(parse_reference_entries(refs)))
-            _rerun()
-    if c2.button("🧹 自动重新编号（按出现顺序去重）", use_container_width=True):
-        ps["references"] = merge_references("", ps.get("references", ""))
-        audit(actor="用户", actor_role="HUMAN", event_type="REFERENCE_RENUMBER",
-              stage="references", target="references", status="success")
-        persist(ps)
-        st.success("已重新编号。")
-        _rerun()
-
-    entries = parse_reference_entries(ps.get("references", ""))
-    if entries:
-        st.dataframe(
-            [{"编号": e["no"], "条目": short(e["text"], 110)} for e in entries],
-            use_container_width=True, hide_index=True,
-        )
+    render_literature_panel(ps, key_prefix="complit")
 
     st.divider()
-    st.markdown("#### ② 全篇格式与结构检查")
+    st.markdown("#### ② 引用编号规范化（GB/T 7714 顺序编码制）")
+    st.caption("顺序编码制要求参考文献按**正文首次出现**的顺序编号。一键生成会自动重排；"
+               "逐步模式下如果你改过正文引用顺序，可以在这里手动重排（会同步改写所有章节的 [n] 标注）。")
+    if st.button("🔢 按正文首次出现顺序重新编号", use_container_width=True):
+        n_total, n_changed = renumber_references_by_appearance(ps)
+        if not n_total:
+            st.warning("文献库为空，无法重排。")
+        elif n_changed == 0:
+            st.success("编号已符合首次出现顺序，无需调整（共引用 %d 条）。" % n_total)
+        else:
+            audit(actor="用户", actor_role="HUMAN", event_type="REFERENCE_RENUMBER",
+                  stage="references", target="references",
+                  prompt="用户手动按首次出现顺序重排", status="success",
+                  detail={"changed": n_changed, "cited": n_total})
+            persist(ps)
+            st.success("已重排 %d 处编号，相关章节的审查结论已作废，请重新运行合规审查。" % n_changed)
+            _rerun()
+
+    st.divider()
+    st.markdown("#### ③ 全篇格式与结构检查")
     if st.button("🔍 运行全篇合规检查（格式 / 结构 / 引用）", type="primary", use_container_width=True):
         doc = build_full_document(ps)
         if not doc.strip():
@@ -2433,7 +2528,7 @@ def render_compliance_tab(ps: Dict[str, Any]) -> None:
         render_findings(rv.get("findings", []), title="全篇检查结论（%s）" % rv["ts"])
 
     st.divider()
-    st.markdown("#### ③ 全局自查重（跨章节 / 自定义比对源）")
+    st.markdown("#### ④ 全局自查重（跨章节 / 自定义比对源）")
     sources_text = st.text_area(
         "比对源（每行一条：来源名称 || 文本片段）", height=120, key="global_sources",
         placeholder="已发表论文节选 || ………\n自己以前写过的段落 || ………",
@@ -2459,6 +2554,531 @@ def render_compliance_tab(ps: Dict[str, Any]) -> None:
               status="blocked" if any(f["level"] == LEVEL_BLOCKER for f in findings) else "passed",
               detail={"findings": findings})
         persist(ps)
+
+
+# ------------------------------ 真实文献库面板 ------------------------------
+
+LIT_SOURCES = {
+    "OpenAlex 全球": "openalex",
+    "OpenAlex 中文": "openalex_zh",
+    "Crossref": "crossref",
+}
+
+
+def render_literature_panel(ps: Dict[str, Any], key_prefix: str = "lit") -> None:
+    """
+    真实文献库面板：检索（免费开放数据库）+ 手工导入（知网/万方引用）+ 库管理。
+    所有文献都来自真实数据源并带 DOI，系统不用大模型编造任何文献。
+    """
+    st.markdown("#### 📚 真实文献库")
+    st.caption(
+        "文献只从**免费开放**的学术数据库检索：OpenAlex（全球库 / 中文库）与 Crossref，"
+        "全部无需注册和 API Key，返回真实 DOI，可逐条点开核验。"
+        "⚠️ 知网 / 万方 / 维普没有免费开放接口，请用下面「手工导入」把你复制到的引用粘贴进来。"
+    )
+
+    if lit is None:
+        st.error("literature.py 未加载成功，暂时只能手工编辑参考文献。")
+        return
+
+    meta = ps["meta"]
+    default_kw = meta.get("keywords") or meta.get("title") or ""
+    c1, c2, c3 = st.columns([3, 1, 1])
+    kw = c1.text_input("检索关键词（建议中文、英文各检索一次）", value=default_kw,
+                       key="%s_kw_%s" % (key_prefix, ps["project_id"]))
+    year_from = c2.number_input("起始年份（0=不限）", min_value=0, max_value=2030,
+                                value=int(meta.get("year_from") or 0), step=1,
+                                key="%s_year_%s" % (key_prefix, ps["project_id"]))
+    limit = c3.number_input("检索条数", min_value=3, max_value=30, value=10, step=1,
+                            key="%s_limit_%s" % (key_prefix, ps["project_id"]))
+    picked_sources = st.multiselect(
+        "数据源", list(LIT_SOURCES.keys()),
+        default=["OpenAlex 全球", "OpenAlex 中文", "Crossref"],
+        key="%s_src_%s" % (key_prefix, ps["project_id"]),
+    )
+
+    res_key = "lit_results_%s" % ps["project_id"]
+    if st.button("🔍 检索真实文献", key="%s_search_%s" % (key_prefix, ps["project_id"]),
+                 use_container_width=True):
+        srcs = [LIT_SOURCES[s] for s in picked_sources]
+        if not srcs:
+            st.warning("请至少选择一个数据源。")
+        elif not kw.strip():
+            st.warning("请填写检索关键词。")
+        else:
+            with st.spinner("正在检索 OpenAlex / Crossref …"):
+                try:
+                    found = lit.search_literature(kw, limit=int(limit),
+                                                  year_from=int(year_from) or None,
+                                                  sources=srcs)
+                    st.session_state[res_key] = found
+                    audit(actor="系统", actor_role="SYSTEM", event_type="LITERATURE_SEARCH",
+                          stage="references", target="references",
+                          prompt="关键词：%s｜年份≥%s｜数据源：%s"
+                                 % (kw, year_from or "不限", "、".join(picked_sources)),
+                          ai_output="命中 %d 条真实文献" % len(found), status="success",
+                          detail={"count": len(found),
+                                  "titles": [r["title"] for r in found[:10]]})
+                    persist(ps)
+                except lit.LiteratureError as exc:
+                    st.error("检索失败：%s" % exc)
+                except Exception as exc:  # 网络异常等
+                    st.error("检索出错：%s" % exc)
+
+    results = st.session_state.get(res_key) or []
+    if results:
+        import pandas as pd
+        st.markdown("**检索结果**（勾选后加入文献库）")
+        rows = []
+        for i, r in enumerate(results):
+            rows.append({
+                "选": False,
+                "作者": short(lit.format_authors_gbt(r.get("authors") or [], 2), 24),
+                "年份": r.get("year") or "",
+                "标题": short(r.get("title") or "", 60),
+                "来源": short(r.get("venue") or "", 30),
+                "DOI": r.get("doi") or "（无，谨慎使用）",
+                "引用数": r.get("cited_by") or 0,
+                "数据源": r.get("source") or "",
+            })
+        edited = st.data_editor(pd.DataFrame(rows), hide_index=True,
+                                use_container_width=True,
+                                key="%s_table_%s" % (key_prefix, ps["project_id"]))
+        cc1, cc2 = st.columns([1, 1])
+        if cc1.button("➕ 把勾选的加入文献库", type="primary", use_container_width=True,
+                      key="%s_add_%s" % (key_prefix, ps["project_id"])):
+            chosen = [results[i] for i in range(len(results)) if bool(edited.iloc[i]["选"])]
+            if not chosen:
+                st.warning("还没有勾选任何文献。")
+            else:
+                merged = get_ref_records(ps) + chosen
+                set_ref_records(ps, merged)
+                audit(actor="用户", actor_role="HUMAN", event_type="REFERENCE_ADD",
+                      stage="references", target="references",
+                      prompt="从检索结果加入 %d 条" % len(chosen),
+                      user_edit=lit.build_reference_list(chosen, meta.get("citation_style")),
+                      status="success", detail={"total": len(merged)})
+                persist(ps)
+                st.success("已加入 %d 条，文献库共 %d 条。" % (len(chosen), len(merged)))
+                st.session_state.pop(res_key, None)
+                _rerun()
+        if cc2.button("🤖 自动挑选相关性最高的 N 条加入", use_container_width=True,
+                      key="%s_auto_%s" % (key_prefix, ps["project_id"])):
+            n = int(limit)
+            chosen = results[:n]
+            merged = get_ref_records(ps) + chosen
+            set_ref_records(ps, merged)
+            audit(actor="用户", actor_role="HUMAN", event_type="REFERENCE_ADD",
+                  stage="references", target="references",
+                  prompt="自动挑选前 %d 条" % len(chosen),
+                  user_edit=lit.build_reference_list(chosen, meta.get("citation_style")),
+                  status="success", detail={"total": len(merged)})
+            persist(ps)
+            st.success("已加入 %d 条，文献库共 %d 条。" % (len(chosen), len(merged)))
+            st.session_state.pop(res_key, None)
+            _rerun()
+
+    with st.expander("📋 手工导入：粘贴知网 / 万方 / 谷歌学术的「引用」文本", expanded=False):
+        st.caption("在知网文献页点「引用」→ 复制 GB/T 7714 那一条 → 粘贴到这里，一行一条。"
+                   "国内文献走这条路最稳（系统负责解析、编号、格式校验）。")
+        paste = st.text_area("粘贴内容", height=140, key="%s_paste_%s" % (key_prefix, ps["project_id"]),
+                             placeholder="[1] 张三. 大学生媒介使用行为研究[J]. 心理科学进展, 2023, 31(4): 612-625.")
+        if st.button("解析并加入文献库", key="%s_paste_btn_%s" % (key_prefix, ps["project_id"]),
+                     use_container_width=True):
+            parsed = lit.parse_reference_text(paste)
+            if not parsed:
+                st.warning("没能解析出文献条目。请确认格式形如：`[1] 作者. 题名[J]. 刊名, 年, 卷(期): 页码.`")
+            else:
+                merged = get_ref_records(ps) + parsed
+                set_ref_records(ps, merged)
+                audit(actor="用户", actor_role="HUMAN", event_type="REFERENCE_IMPORT",
+                      stage="references", target="references", prompt=paste,
+                      user_edit=lit.build_reference_list(parsed, meta.get("citation_style")),
+                      status="success", detail={"parsed": len(parsed), "total": len(merged)})
+                persist(ps)
+                st.success("成功解析 %d 条，文献库共 %d 条。请核对著录信息。" % (len(parsed), len(merged)))
+                _rerun()
+
+    records = get_ref_records(ps)
+    st.markdown("**当前文献库：%d 条**" % len(records))
+    if records:
+        import pandas as pd
+        untraceable = [r for r in records if not lit.has_provenance(r)]
+        if untraceable:
+            st.warning("有 %d 条文献**没有 DOI 或原文链接**，无法溯源。"
+                       "建议在知网/谷歌学术确认后再用，合规审查会就此给出预警。" % len(untraceable))
+        st.dataframe(pd.DataFrame([{
+            "序号": i + 1,
+            "作者": short(lit.format_authors_gbt(r.get("authors") or [], 2), 22),
+            "年份": r.get("year") or "",
+            "标题": short(r.get("title") or "", 56),
+            "来源": short(r.get("venue") or "", 26),
+            "可溯源": "✅" if lit.has_provenance(r) else "⚠️ 无DOI",
+        } for i, r in enumerate(records)]), hide_index=True, use_container_width=True)
+        cc1, cc2 = st.columns([1, 1])
+        if cc1.button("🧹 去重并重新编号", use_container_width=True,
+                      key="%s_dedup_%s" % (key_prefix, ps["project_id"])):
+            seen, uniq = set(), []
+            for r in records:
+                k = (r.get("doi") or "").lower() or (r.get("title") or "")[:60]
+                if k and k not in seen:
+                    seen.add(k)
+                    uniq.append(r)
+            set_ref_records(ps, uniq)
+            audit(actor="用户", actor_role="HUMAN", event_type="REFERENCE_DEDUP",
+                  stage="references", target="references", status="success",
+                  detail={"before": len(records), "after": len(uniq)})
+            persist(ps)
+            st.success("去重完成：%d → %d 条。" % (len(records), len(uniq)))
+            _rerun()
+        if cc2.button("🗑️ 清空文献库", use_container_width=True,
+                      key="%s_clear_%s" % (key_prefix, ps["project_id"])):
+            set_ref_records(ps, [])
+            audit(actor="用户", actor_role="HUMAN", event_type="REFERENCE_CLEAR",
+                  stage="references", target="references", status="success")
+            persist(ps)
+            _rerun()
+
+    with st.expander("✏️ 手工编辑参考文献 Markdown（高级）", expanded=False):
+        st.caption("直接改文本也可以：保存后系统会重新解析回结构化文献库。")
+        refs_text = st.text_area("参考文献 Markdown", value=ps.get("references", ""),
+                                 height=200, key="%s_text_%s" % (key_prefix, ps["project_id"]))
+        if st.button("💾 保存文本并重新解析", key="%s_save_%s" % (key_prefix, ps["project_id"])):
+            diff = unified_diff(ps.get("references", ""), refs_text, "参考文献库")
+            ps["references"] = refs_text
+            ps["ref_records"] = lit.parse_reference_text(refs_text)
+            audit(actor=ps["meta"].get("student") or "用户", actor_role="HUMAN",
+                  event_type="USER_EDIT", stage="references", target="references",
+                  prompt="用户编辑参考文献 Markdown", user_edit=diff, status="success",
+                  detail={"parsed": len(ps["ref_records"])})
+            persist(ps)
+            st.success("已保存，解析出 %d 条。" % len(ps["ref_records"]))
+            _rerun()
+
+
+# ------------------------------ 一键生成（快速模式） ------------------------------
+
+def auto_search_references(ps: Dict[str, Any], want: int, keyword: str = "") -> int:
+    """一键模式第一步：自动检索真实文献并入库，返回入库条数。"""
+    if lit is None:
+        return 0
+    meta = ps["meta"]
+    queries = []
+    base = (keyword or meta.get("keywords") or "").strip()
+    if base:
+        queries.append(base)
+    title = (meta.get("title") or "").strip()
+    if title and title not in queries:
+        queries.append(title)
+    queries.append(meta.get("major") or "")
+    queries = [q for q in queries if q]
+
+    collected: List[Dict[str, Any]] = []
+    for q in queries[:2]:
+        for srcs in (("openalex_zh", "crossref"), ("openalex",)):
+            try:
+                collected += lit.search_literature(q, limit=want, year_from=meta.get("year_from") or None,
+                                                   sources=srcs)
+            except lit.LiteratureError:
+                continue
+        if len(collected) >= want:
+            break
+
+    # 去重 + 只保留可溯源（有 DOI/URL）的文献，宁缺毋滥
+    seen, uniq = set(), []
+    for r in collected:
+        k = (r.get("doi") or "").lower() or (r.get("title") or "")[:60]
+        if not k or k in seen:
+            continue
+        if not lit.has_provenance(r):
+            continue
+        seen.add(k)
+        uniq.append(r)
+    uniq.sort(key=lambda r: (-(r.get("year") or 0), -(r.get("cited_by") or 0)))
+
+    if uniq:
+        set_ref_records(ps, uniq[:want])
+    audit(actor="系统", actor_role="SYSTEM", event_type="AUTO_LITERATURE",
+          stage="references", target="references",
+          prompt="一键模式自动检索：%s" % "；".join(queries[:2]),
+          ai_output=lit.build_reference_list(uniq[:want], meta.get("citation_style")) if uniq else "",
+          status="success" if uniq else "empty",
+          detail={"count": len(uniq[:want]), "mode": "auto"})
+    return len(uniq[:want])
+
+
+def renumber_references_by_appearance(ps: Dict[str, Any]) -> Tuple[int, int]:
+    """
+    按正文首次出现顺序重排参考文献编号（GB/T 7714 顺序编码制的要求）。
+    会同步改写各章正文里的 [n] 标注、重排文献库，并使相关审查结论作废（必须重审）。
+    返回 (被引用的文献数, 编号发生变化的条数)。
+    """
+    records = get_ref_records(ps)
+    if not records:
+        return 0, 0
+
+    order: List[int] = []
+    for ch in ps["chapters"]:
+        for n in extract_intext_citations(ch.get("text") or ""):
+            if n not in order and 1 <= n <= len(records):
+                order.append(n)
+    for i in range(1, len(records) + 1):     # 未被引用的排在最后
+        if i not in order:
+            order.append(i)
+
+    mapping = {old: new for new, old in enumerate(order, start=1)}
+    changed = sum(1 for k, v in mapping.items() if k != v)
+    if changed == 0:
+        return len(order), 0
+
+    def repl(m: "re.Match") -> str:
+        nums = [int(x) for x in re.split(r"[,，\-–]", m.group(1)) if x.strip().isdigit()]
+        if not nums:
+            return m.group(0)
+        new = sorted(mapping.get(n, n) for n in nums)
+        return "[%d]" % new[0] if len(new) == 1 else "[%s]" % ",".join(str(x) for x in new)
+
+    for ch in ps["chapters"]:
+        if ch.get("text"):
+            new_text = CITE_RE.sub(repl, ch["text"])
+            if new_text != ch["text"]:
+                ch["text"] = new_text
+                ch["version"] = int(ch.get("version", 0)) + 1
+                ps["reviews"].pop("chapter_%d" % ch["index"], None)
+
+    set_ref_records(ps, [records[i - 1] for i in order])
+    return len(order), changed
+
+
+def run_auto_pipeline(ps: Dict[str, Any], *, want_refs: int, use_review: bool) -> None:
+    """
+    一键生成流水线：文献检索 → 大纲 → 逐章初稿 → 按首次出现顺序重排引用编号
+    →（可选）逐章自动合规审查 → 收尾。
+    全程写入审计日志（event_type 带 AUTO_ 前缀，mode=auto），便于事后追溯。
+    """
+    meta = ps["meta"]
+    llm = SS["llm"]
+    n_ch = max(1, int(meta.get("chapter_count") or 5))
+    total_steps = 2 + n_ch + (n_ch if use_review else 0)
+    done = 0
+    progress = st.progress(0.0, text="准备中…")
+
+    def step(label: str) -> None:
+        nonlocal done
+        done += 1
+        progress.progress(min(1.0, done / max(1, total_steps)),
+                          text="[%d/%d] %s" % (done, total_steps, label))
+
+    ps["mode"] = "auto"
+
+    # ---- 1) 真实文献 ----
+    step("检索真实文献（OpenAlex / Crossref）")
+    with st.expander("① 文献检索结果", expanded=False):
+        st.write("正在检索真实文献…")
+        n_refs = auto_search_references(ps, want_refs)
+        if n_refs:
+            st.success("已入库 %d 条真实文献（均带 DOI 可核验）。" % n_refs)
+            st.markdown(ps.get("references", ""))
+        else:
+            st.warning("没有检索到可溯源的文献。后续正文将不含引用标注，"
+                       "合规审查会因此给出阻断提示——这是系统的防造假设计，不是故障。")
+    persist(ps)
+
+    # ---- 2) 大纲 ----
+    step("规划师生成大纲")
+    with st.expander("② 论文大纲", expanded=True):
+        planner = PlannerAgent(llm)
+        outline_text = stream_to_ui(
+            planner.generate_outline(meta, extra="请严格使用我提供的参考文献编号，不要编造文献。",
+                                     feedback=""),
+            label="🧭 规划师 Agent 正在生成大纲…")
+        if not outline_text:
+            st.error("大纲生成失败，一键流程已中止。")
+            return
+        ps["outline"]["text"] = outline_text
+        ps["outline"]["version"] = int(ps["outline"].get("version", 0)) + 1
+        ps["outline"]["status"] = "approved"      # 一键模式自动通过（记入审计）
+        ps["outline"]["approved_at"] = now_ts()
+        ps["outline"]["approved_by"] = "一键模式自动通过"
+        save_artifact(ps["project_id"], "outline", 0, ps["outline"]["version"],
+                      "approved", outline_text, note="AUTO 一键生成")
+        audit(actor=PlannerAgent.name, actor_role="AGENT", event_type="AUTO_OUTLINE",
+              stage="outline", target="outline",
+              prompt="generate_outline（一键模式，自动批准）", ai_output=outline_text,
+              status="approved", detail={"version": ps["outline"]["version"], "mode": "auto"})
+        st.markdown(outline_text)
+
+    chapters = parse_outline(ps["outline"]["text"], meta.get("chapter_count", 5))
+    targets = allocate_word_targets(int(meta.get("target_words", 12000)), chapters)
+    ps["chapters"] = [{
+        "index": c["index"], "title": c["title"], "sections": c["sections"],
+        "target_words": targets[i] if i < len(targets) else 1200,
+        "text": "", "version": 0, "status": "pending",
+        "approved_at": "", "feedback": "",
+    } for i, c in enumerate(chapters)]
+    persist(ps)
+
+    # ---- 3) 逐章撰写（先全部写完，再统一重排编号，最后统一审查）----
+    writer = WriterAgent(llm)
+    ref_block = reference_records_block(ps)
+    for ch in ps["chapters"]:
+        step("撰写第%d章 %s" % (ch["index"], ch["title"]))
+        with st.expander("③ 第%d章 %s" % (ch["index"], ch["title"]), expanded=True):
+            text = stream_to_ui(
+                writer.write_chapter(meta, ps["outline"]["text"], ch,
+                                     ch.get("target_words", 1200),
+                                     references=ref_block, extra="", feedback=""),
+                label="✍️ 正在撰写第%d章…" % ch["index"])
+            if not text:
+                st.warning("第%d章生成失败，已跳过（可稍后在撰写页单独重试）。" % ch["index"])
+                continue
+            ch["text"] = text
+            ch["version"] = 1
+            ch["status"] = "draft"
+            save_artifact(ps["project_id"], "chapter", ch["index"], 1, "draft", text,
+                          note="AUTO 一键生成")
+            audit(actor=WriterAgent.name, actor_role="AGENT", event_type="AUTO_CHAPTER",
+                  stage="chapter", target="chapter_%d" % ch["index"],
+                  prompt="write_chapter（一键模式）｜目标 %d 字" % ch.get("target_words", 0),
+                  ai_output=text, status="draft",
+                  detail={"version": 1, "words": count_words(text), "mode": "auto"})
+            persist(ps)
+
+    # ---- 4) 按正文首次出现顺序重排引用编号（GB/T 7714 顺序编码制）----
+    step("按正文首次出现顺序重排引用编号")
+    n_total, n_changed = renumber_references_by_appearance(ps)
+    if n_changed:
+        st.info("已按 GB/T 7714 顺序编码制要求重排引用编号：%d 处编号发生变化"
+                "（正文标注与文献表已同步，未引用的文献排在最后）。" % n_changed)
+        audit(actor="系统", actor_role="SYSTEM", event_type="REFERENCE_RENUMBER",
+              stage="references", target="references",
+              prompt="一键模式：按正文首次出现顺序重排", status="success",
+              detail={"changed": n_changed, "cited": n_total, "mode": "auto"})
+        persist(ps)
+
+    # ---- 5) 逐章自动合规审查 ----
+    if use_review:
+        agent_c = ComplianceAgent(llm)
+        for ch in ps["chapters"]:
+            if not ch.get("text"):
+                continue
+            step("合规审查第%d章" % ch["index"])
+            with st.expander("④ 第%d章合规审查" % ch["index"], expanded=False):
+                rule_findings = RuleEngine.run_all(
+                    text=ch["text"], kind="chapter",
+                    style=meta.get("citation_style", CITATION_STYLES[0]),
+                    target_name=chapter_display_title(ch), target_words=ch.get("target_words", 0),
+                    project_references=ps.get("references", ""),
+                    chapters=ps["chapters"], outline_chapters=ps["chapters"], chapter=ch)
+                llm_findings: List[Dict[str, Any]] = []
+                summary = ""
+                review_text = ""
+                try:
+                    review_text = "".join(agent_c.llm_review(
+                        text=ch["text"], kind="chapter",
+                        style=meta.get("citation_style", CITATION_STYLES[0]),
+                        outline_text=ps["outline"].get("text", ""),
+                        target_name=chapter_display_title(ch),
+                        references=ps.get("references", "")))
+                    llm_findings, summary = ComplianceAgent.parse_llm_findings(review_text)
+                except LLMError as exc:
+                    st.warning("第%d章自动审查调用失败：%s" % (ch["index"], exc))
+                findings = sorted(rule_findings + llm_findings,
+                                  key=lambda x: (LEVEL_ORDER.get(x["level"], 9), x["category"]))
+                ps["reviews"]["chapter_%d" % ch["index"]] = {
+                    "version": int(ch.get("version", 1)), "ts": now_ts(), "kind": "chapter",
+                    "target": chapter_display_title(ch), "findings": findings,
+                    "llm_text": review_text, "summary": summary,
+                    "blockers": sum(1 for f in findings if f["level"] == LEVEL_BLOCKER),
+                    "warnings": sum(1 for f in findings if f["level"] == LEVEL_WARNING),
+                }
+                audit(actor=ComplianceAgent.name, actor_role="AGENT",
+                      event_type="AUTO_COMPLIANCE_CHECK", stage="chapter",
+                      target="chapter_%d" % ch["index"],
+                      prompt="一键模式自动审查", ai_output=review_text,
+                      status="blocked" if ps["reviews"]["chapter_%d" % ch["index"]]["blockers"] else "passed",
+                      detail={"findings": findings, "mode": "auto"})
+                render_findings(findings, title="第%d章自动审查结论" % ch["index"])
+                persist(ps)
+
+    step("汇编与收尾")
+    push_history(ps, "一键生成完成：%d 章 / %d 条文献"
+                 % (sum(1 for c in ps["chapters"] if c.get("text")),
+                    len(get_ref_records(ps))))
+    persist(ps)
+    progress.progress(1.0, text="完成")
+    st.success("🎉 一键生成完成！请到【✍️ 撰写员 · 章节】逐章核对修改，"
+               "确认无误后在【📤 导出】生成定稿。")
+
+
+def render_auto_tab(ps: Dict[str, Any]) -> None:
+    st.markdown("### ⚡ 一键生成（快速模式）")
+    st.warning(
+        "该模式会**连续跑完**：检索真实文献 → 生成大纲 → 逐章撰写 →（可选）逐章合规审查。\n\n"
+        "它不会再逐环节停下等你批准——**这是「快速出初稿」通道，不是「一键交论文」**。"
+        "生成结束后，每一章仍是**待你逐字核对**的初稿，导出定稿前请在撰写页批准，"
+        "全部操作都会写入审计日志（标记为 auto 模式）。"
+    )
+
+    if ps["outline"].get("text") or any(c.get("text") for c in ps["chapters"]):
+        st.info("当前项目已有内容。一键生成会**覆盖**大纲与全部章节草稿"
+                "（旧稿仍保留在稿件版本历史里，可在【导出】页找回）。")
+
+    meta = ps["meta"]
+    c1, c2, c3 = st.columns(3)
+    want_refs = c1.slider("自动入库文献数", 5, 25, 12, key="auto_refs")
+    c2.metric("章节数", meta.get("chapter_count"))
+    c3.metric("目标总字数", meta.get("target_words"))
+    use_review = st.checkbox("每章生成后自动做一次合规审查（推荐，会多消耗一些 token）",
+                             value=True, key="auto_review")
+    kw = st.text_input("文献检索关键词（留空则用论文题目）",
+                       value=meta.get("keywords") or "", key="auto_kw")
+    ok = st.checkbox(
+        "我已了解：一键生成产出的是**初稿**，我必须逐字核对文献引用与数据表述后，"
+        "才能作为本人论文提交，并自愿承担相应学术责任。", key="auto_confirm")
+
+    if st.button("⚡ 开始一键生成", type="primary", disabled=not ok, use_container_width=True):
+        if kw.strip():
+            ps["meta"]["keywords"] = kw.strip()
+        audit(actor=meta.get("student") or "用户", actor_role="HUMAN",
+              event_type="AUTO_START", stage="system", target="document",
+              prompt="一键生成｜文献 %d 条｜自动审查 %s" % (want_refs, use_review),
+              user_edit="已勾选初稿核对声明", status="started",
+              detail={"mode": "auto"})
+        persist(ps)
+        run_auto_pipeline(ps, want_refs=int(want_refs), use_review=use_review)
+        _rerun()
+
+    st.divider()
+    st.markdown("#### 生成后的快速收尾")
+    st.caption("如果你已经通读过全文，可以一次性批准所有章节；系统会记录「用户声明已通读」。")
+    st.markdown("**当前待批准章节**：%d / %d"
+                % (sum(1 for c in ps["chapters"] if c.get("status") != "approved"),
+                   len(ps["chapters"])))
+    ok2 = st.checkbox("我已通读全部章节，确认无抄袭、无编造数据与文献", key="auto_batch_confirm")
+    if st.button("✅ 一键批准全部章节", disabled=not ok2 or not ps["chapters"],
+                 use_container_width=True):
+        n = 0
+        for ch in ps["chapters"]:
+            if ch.get("text") and ch.get("status") != "approved":
+                ch["status"] = "approved"
+                ch["approved_at"] = now_ts()
+                save_artifact(ps["project_id"], "chapter", ch["index"],
+                              int(ch.get("version", 1)), "approved", ch["text"],
+                              note="用户批量批准")
+                n += 1
+        audit(actor=meta.get("student") or "用户", actor_role="HUMAN",
+              event_type="APPROVE", stage="chapter", target="all_chapters",
+              user_edit="批量批准声明已勾选：我已通读全部章节", status="approved",
+              detail={"approved": n, "mode": "auto"})
+        push_history(ps, "用户批量批准 %d 章" % n)
+        persist(ps)
+        st.success("已批准 %d 章，现在可以到【📤 导出】生成定稿。" % n)
+        _rerun()
+
+    st.divider()
+    st.markdown("#### 📚 文献库（两种模式共用）")
+    render_literature_panel(ps, key_prefix="autolit")
 
 
 # ------------------------------ 审计日志页 ------------------------------
@@ -2652,20 +3272,22 @@ def main() -> None:
         st.info("ℹ️ 当前为离线演示模式（未配置 `DEEPSEEK_API_KEY`），生成的文本来自本地模板，"
                 "仅用于演示 HITL 流程与审计日志。配置环境变量后重启应用即可调用 `deepseek-chat`。")
 
-    tabs = st.tabs(["📋 概览与流程", "🧭 规划师 · 大纲", "✍️ 撰写员 · 章节",
+    tabs = st.tabs(["📋 概览与流程", "⚡ 一键生成", "🧭 规划师 · 大纲", "✍️ 撰写员 · 章节",
                     "🛡️ 合规审查", "🧾 审计日志", "📤 导出"])
 
     with tabs[0]:
         render_overview(ps)
     with tabs[1]:
-        render_planner_tab(ps)
+        render_auto_tab(ps)
     with tabs[2]:
-        render_writer_tab(ps)
+        render_planner_tab(ps)
     with tabs[3]:
-        render_compliance_tab(ps)
+        render_writer_tab(ps)
     with tabs[4]:
-        render_audit_tab(ps)
+        render_compliance_tab(ps)
     with tabs[5]:
+        render_audit_tab(ps)
+    with tabs[6]:
         render_export_tab(ps)
 
 

@@ -270,6 +270,52 @@ def part_a():
         src = fp.read()
     check("app.py 在模块级用 utf-8-sig 读取 .env", 'encoding="utf-8-sig"' in src)
 
+    # ------------------ A12. 真实文献模块（免费开放数据源） ------------------
+    print("\n[A12] 文献检索模块：著录格式 / 手工导入 / 溯源判定")
+    import literature as lit_mod
+
+    check("作者名「名 姓」被纠正", lit_mod._split_name("晓雅 王")["name"] == "王晓雅",
+          lit_mod._split_name("晓雅 王")["name"])
+    check("作者名「姓, 名」被纠正", lit_mod._split_name("张, 光闪")["name"] == "张光闪",
+          lit_mod._split_name("张, 光闪")["name"])
+    check("西文作者缩写（GB/T 无缩写点）",
+          lit_mod.format_authors_gbt([{"family": "Smith", "given": "John A.", "name": ""}]) == "SMITH J A",
+          lit_mod.format_authors_gbt([{"family": "Smith", "given": "John A.", "name": ""}]))
+    check("西文作者缩写（APA 带缩写点）",
+          "Smith, J. A." in lit_mod.format_authors_apa([{"family": "Smith", "given": "John A.", "name": ""}]))
+
+    cn_ref = ("[1] 赵赫, 于晟伟, 王洪庆. 短视频沉迷对大学生的注意力下降影响[J]. "
+              "中国科学与技术学报, 2025, 1(1): 947-955.")
+    recs = lit_mod.parse_reference_text(cn_ref)
+    check("知网引用文本可解析", len(recs) == 1)
+    if recs:
+        r = recs[0]
+        check("解析出题名/年份/卷期页",
+              r["title"].startswith("短视频沉迷") and r["year"] == 2025
+              and r["volume"] == "1" and r["issue"] == "1" and r["pages"] == "947-955",
+              "%s | %s | %s(%s): %s" % (r["title"][:16], r["year"], r["volume"], r["issue"], r["pages"]))
+        check("无 DOI 时判定为不可溯源", not lit_mod.has_provenance(r))
+        gbt = lit_mod.format_reference(r, "GB/T 7714-2015（顺序编码制）")
+        check("GB/T 著录含类型标识与卷期页", "[J]" in gbt and "1(1)" in gbt and "947-955" in gbt, gbt[:60])
+
+    with_doi = dict(recs[0], doi="10.1234/abcd.2025.001") if recs else {}
+    if with_doi:
+        check("有 DOI 时判定为可溯源", lit_mod.has_provenance(with_doi))
+        out = lit_mod.format_reference(with_doi)
+        check("GB/T 著录带 DOI", "DOI: 10.1234/abcd.2025.001" in out, out[-40:])
+        apa = lit_mod.format_reference(with_doi, "APA 第7版")
+        check("APA 著录带 https://doi.org/", "https://doi.org/10.1234/abcd.2025.001" in apa, apa[-46:])
+
+    lst = lit_mod.build_reference_list([with_doi] if with_doi else [])
+    check("参考文献列表自动编号", lst.startswith("## 参考文献") and "[1] " in lst)
+
+    findings = app.RuleEngine.check_reference_provenance(cn_ref)
+    check("合规规则：来源不可追溯 → 预警",
+          any(f["category"] == "来源不可追溯" for f in findings))
+    findings = app.RuleEngine.check_reference_provenance(
+        cn_ref.replace("947-955.", "947-955. DOI: 10.1234/x."))
+    check("合规规则：补齐 DOI 后不再预警", not findings)
+
     # 供 B 部分复用的临时工程（不落库，仅内存态）
     return True
 
@@ -409,6 +455,103 @@ def app_state_init():
 
 
 # =============================================================================
+# C. 一键生成模式端到端自检（离线 mock 大模型 + 打桩的文献检索）
+# =============================================================================
+
+FAKE_RECORDS = [
+    {"title": "短视频使用与大学生注意力的关系研究", "authors": [{"family": "", "given": "", "name": "张三"}],
+     "year": 2023, "venue": "心理科学进展", "volume": "31", "issue": "4", "pages": "612-625",
+     "doi": "10.3724/SP.J.1041.2023.00612", "url": "", "type": "J", "source": "测试桩",
+     "cited_by": 42, "abstract": ""},
+    {"title": "移动短视频对青少年认知加工的影响", "authors": [{"family": "", "given": "", "name": "李四"},
+                                                              {"family": "", "given": "", "name": "王五"}],
+     "year": 2022, "venue": "中国电化教育", "volume": "43", "issue": "5", "pages": "12-19",
+     "doi": "10.1234/cee.2022.005", "url": "", "type": "J", "source": "测试桩",
+     "cited_by": 31, "abstract": ""},
+    {"title": "The effect of short-video use on sustained attention",
+     "authors": [{"family": "Smith", "given": "John A.", "name": ""}],
+     "year": 2024, "venue": "Cognitive Processing", "volume": "25", "issue": "2", "pages": "100-115",
+     "doi": "10.1007/s10339-024-00001-0", "url": "", "type": "J", "source": "测试桩",
+     "cited_by": 18, "abstract": ""},
+    {"title": "大学生媒介使用行为研究", "authors": [{"family": "", "given": "", "name": "赵六"}],
+     "year": 2021, "venue": "北京大学出版社", "volume": "", "issue": "", "pages": "33-40",
+     "doi": "10.5555/book.2021.001", "url": "", "type": "M", "source": "测试桩",
+     "cited_by": 5, "abstract": ""},
+]
+
+
+def part_c():
+    section("C. 一键生成模式自检（离线 mock + 文献检索打桩）")
+    try:
+        from streamlit.testing.v1 import AppTest
+    except ImportError:
+        print("  [SKIP] 当前 Streamlit 版本不支持 AppTest（需 ≥1.28）。")
+        return
+
+    import literature as lit_mod
+    import app as app_mod
+
+    calls = []
+
+    def fake_search(query, limit=10, year_from=None,
+                    sources=("openalex", "openalex_zh", "crossref")):
+        calls.append(query)
+        return [dict(r) for r in FAKE_RECORDS]
+
+    orig = lit_mod.search_literature
+    lit_mod.search_literature = fake_search
+    try:
+        at = AppTest.from_file(APP_PATH, default_timeout=300)
+        at.run()
+        at.sidebar.text_input[0].set_value("短视频使用对大学生注意力的影响研究")
+        at.sidebar.text_input[1].set_value("教育技术学")
+        find_element(at.sidebar.button, "创建项目").click()
+        at.run()
+        check("一键模式：创建项目无异常", not at.exception, str(list(at.exception)))
+
+        check("一键模式：未勾选声明时按钮禁用",
+              bool(getattr(find_element(at.button, "开始一键生成"), "disabled", False)))
+        find_element(at.checkbox, "我已了解").check()
+        at.run()
+        find_element(at.button, "开始一键生成").click()
+        at.run()
+        check("一键模式：全流程执行无异常", not at.exception, str(list(at.exception)))
+
+        ps = at.session_state["pstate"]
+        check("一键模式：已标记 mode=auto", ps.get("mode") == "auto", str(ps.get("mode")))
+        check("一键模式：自动检索了文献", len(calls) > 0, "调用检索 %d 次" % len(calls))
+        check("一键模式：文献库已自动入库", len(ps.get("ref_records") or []) >= 3,
+              "%d 条" % len(ps.get("ref_records") or []))
+        check("一键模式：参考文献文本已生成（带 [n] 编号）",
+              "[1]" in (ps.get("references") or ""))
+        check("一键模式：大纲已生成并自动批准",
+              bool(ps["outline"]["text"]) and ps["outline"]["status"] == "approved")
+        written = [c for c in ps["chapters"] if c.get("text")]
+        check("一键模式：章节逐章生成完毕", len(written) == len(ps["chapters"]) and len(written) > 0,
+              "已写 %d/%d 章" % (len(written), len(ps["chapters"])))
+        check("一键模式：每章都留有自动审查结论",
+              all(("chapter_%d" % c["index"]) in ps["reviews"] for c in ps["chapters"]))
+        events = {r["event_type"] for r in app_mod.fetch_logs(ps["project_id"])}
+        check("一键模式：审计日志记录 AUTO_* 事件",
+              {"AUTO_START", "AUTO_LITERATURE", "AUTO_OUTLINE", "AUTO_CHAPTER"} <= events,
+              str(sorted(e for e in events if e.startswith("AUTO"))))
+        check("一键模式：审计日志标记 mode=auto",
+              any("auto" in (r["detail"] or "") for r in app_mod.fetch_logs(ps["project_id"])))
+        ok, broken = app_mod.verify_hash_chain(ps["project_id"])
+        check("一键模式：日志哈希链完整", ok and not broken, str(broken))
+
+        find_element(at.checkbox, "我已通读全部章节").check()
+        at.run()
+        find_element(at.button, "一键批准全部章节").click()
+        at.run()
+        ps = at.session_state["pstate"]
+        check("一键模式：批量批准后章节全部通过",
+              all(c["status"] == "approved" for c in ps["chapters"] if c.get("text")))
+    finally:
+        lit_mod.search_literature = orig
+
+
+# =============================================================================
 # main
 # =============================================================================
 
@@ -417,6 +560,7 @@ def main():
     try:
         part_a()
         part_b()
+        part_c()
     finally:
         print("\n" + "=" * 78)
         print("自检结果：通过 %d 项，失败 %d 项" % (len(PASSED), len(FAILED)))
