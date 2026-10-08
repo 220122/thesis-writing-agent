@@ -1787,10 +1787,12 @@ def run_compliance_check(ps: Dict[str, Any], *, target_key: str, text: str, kind
     if use_llm:
         st.caption("第二步：调用合规审查员 Agent 进行语义层深度审查（大模型）…")
         agent = ComplianceAgent(SS["llm"])
+        # 审查大纲时不要把大纲自身当成「已批准大纲」参照，否则模型只会回一句“与自身完全一致”
+        outline_ref = "" if kind == "outline" else ps["outline"].get("text", "")
         llm_text = stream_to_ui(
             agent.llm_review(text=text, kind=kind,
                              style=meta.get("citation_style", CITATION_STYLES[0]),
-                             outline_text=ps["outline"].get("text", ""),
+                             outline_text=outline_ref,
                              target_name=target_name),
             label="🛡️ 合规审查员 Agent 审查中…",
         ) or ""
@@ -2167,6 +2169,17 @@ def render_writer_tab(ps: Dict[str, Any]) -> None:
         )
     if chapter["status"] == "approved":
         st.success("✅ 本章已批准。如需修改，请先点击下方“撤回批准”（会写入审计日志）。")
+
+    if not (ps.get("references") or "").strip():
+        st.warning(
+            "⚠️ 当前**项目参考文献库为空**，请注意一个必然结果：\n\n"
+            "撰写员 Agent 的底线是「绝不编造文献」，所以它在无文献可用时**不会写任何引用标注**；"
+            "而合规审查员会把「全章无引用」判为 🛑 阻断项，于是你就无法批准本章——这不是 bug，"
+            "而是系统在阻止你提交一篇没有文献支撑的论文。\n\n"
+            "**建议做法**：先到【🛡️ 合规审查】页，把你从中国知网 / Google 学术找到的**真实文献**"
+            "按 `[1] 作者. 题名[J]. 刊名, 年, 卷(期): 页码.` 的格式录入参考文献库，再回来生成章节。"
+            "（本系统刻意不提供「AI 代写参考文献」功能，因为那正是编造文献的高发区。）"
+        )
 
     # ---- 生成 ----
     st.divider()

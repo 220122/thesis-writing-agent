@@ -58,15 +58,90 @@ function Mask-Key {
     return $Key.Substring(0, 6) + "****" + $Key.Substring($Key.Length - 4)
 }
 
+function Get-KeyFromText {
+    # 从任意粘贴内容里提取 sk- 开头的 Key（兼容粘贴了整行 DEEPSEEK_API_KEY=sk-xxx 的情况）
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return "" }
+    $m = [regex]::Match($Text, 'sk-[A-Za-z0-9_\-]{10,}')
+    if ($m.Success) { return $m.Value }
+    return ""
+}
+
 function Read-ApiKey {
-    try {
-        $sec = Read-Host "   请粘贴你的 DeepSeek API Key（输入不显示；直接回车跳过）" -AsSecureString
-        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
-        try { return ([Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)).Trim() }
-        finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
-    } catch {
-        return (Read-Host "   请粘贴你的 DeepSeek API Key（直接回车跳过）").Trim()
+    <#
+      读取 DeepSeek API Key。为兼容各种终端，提供 4 种方式：
+        1) 鼠标【右键】粘贴（Windows 传统控制台最可靠）
+        2) Ctrl+V 粘贴
+        3) 先把 Key 复制好，然后直接按【回车】→ 脚本自动读取剪贴板
+        4) 输入 E 回车 → 用记事本手动编辑 .env
+      返回值：Key 字符串；返回空串表示跳过；返回 __EDIT__ 表示改用记事本。
+    #>
+    param()
+
+    if ($NonInteractive) { return "" }
+
+    Write-Host ""
+    Write-Host "   ┌─ 粘贴小提示 ───────────────────────────────────────────────┐" -ForegroundColor DarkGray
+    Write-Host "   │ 在这个窗口里：鼠标【右键】= 粘贴（最可靠）                  │" -ForegroundColor DarkGray
+    Write-Host "   │ 若右键/Ctrl+V 都没反应：先把 Key 复制到剪贴板，再直接按回车 │" -ForegroundColor DarkGray
+    Write-Host "   │ 也可以输入 E 回车，用记事本手动填写 .env                    │" -ForegroundColor DarkGray
+    Write-Host "   └────────────────────────────────────────────────────────────┘" -ForegroundColor DarkGray
+
+    for ($try = 1; $try -le 3; $try++) {
+        $ans = Read-Host "   请粘贴你的 DeepSeek API Key（回车=读剪贴板 / E=记事本 / 空回车跳过）"
+
+        if ($ans -and $ans.Trim() -match '^[Ee]$') { return "__EDIT__" }
+
+        if ($ans -and $ans.Trim()) {
+            $key = Get-KeyFromText $ans
+            if ($key) { return $key }
+            Write-Warn2 "这段内容里没找到以 sk- 开头的 Key，请重新粘贴（或按回车读取剪贴板）"
+            continue
+        }
+
+        # 空回车 → 尝试从剪贴板读取
+        $clip = ""
+        try { $clip = ([string](Get-Clipboard -Raw)) } catch { $clip = "" }
+        $clipKey = Get-KeyFromText $clip
+        if ($clipKey) {
+            Write-Ok ("已从剪贴板读取到 Key：" + (Mask-Key $clipKey))
+            return $clipKey
+        }
+        if ($clip -and $clip.Trim()) { Write-Warn2 ("剪贴板内容里没有 sk- 开头的 Key（读到：" + (Mask-Key $clip.Trim()) + "）") }
+        else { Write-Warn2 "剪贴板里没有文本内容（可能是沙箱/远程桌面环境读不到剪贴板）" }
+        Write-Note "已跳过输入：应用将以【离线演示模式】运行，之后随时可以重跑本脚本填写"
+        return ""
     }
+    return ""
+}
+
+function Edit-EnvWithNotepad {
+    # 用记事本手动编辑 .env，关闭记事本后自动读回 Key
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        [System.IO.File]::WriteAllText($Path,
+            "# 把下面等号后面替换成你的 DeepSeek API Key（保留 sk- 前缀），保存后关闭记事本`r`n`r`nDEEPSEEK_API_KEY=`r`n",
+            (New-Object System.Text.UTF8Encoding($false)))
+    }
+    Write-Note "正在打开记事本，请在 DEEPSEEK_API_KEY= 后面粘贴你的 Key，然后 Ctrl+S 保存并关闭记事本…"
+    try { Start-Process -FilePath "notepad.exe" -ArgumentList ('"' + $Path + '"') -Wait }
+    catch { Write-Warn2 "无法打开记事本：$($_.Exception.Message)" }
+    if (Test-Path -LiteralPath $Path) {
+        $m = [regex]::Match([System.IO.File]::ReadAllText($Path), 'DEEPSEEK_API_KEY\s*=\s*(\S+)')
+        if ($m.Success) {
+            $k = Get-KeyFromText $m.Groups[1].Value
+            if ($k) { return $k }
+        }
+    }
+    return ""
+}
+
+function Resolve-KeyInput {
+    # 统一处理 Read-ApiKey 的返回值：__EDIT__ → 改用记事本；其余原样返回
+    param([string]$Value)
+    if ($Value -eq "__EDIT__") { return (Edit-EnvWithNotepad -Path $envFile) }
+    if ($Value) { return $Value }
+    return ""
 }
 
 # ============================== 环境检测 ==============================
@@ -225,16 +300,16 @@ if ($ApiKey) {
     Write-Note "使用命令行参数提供的 Key"
 } elseif ($currentKey -match '^sk-\S+') {
     Write-Ok ("项目 .env 中已有 Key：" + (Mask-Key $currentKey))
-    if (Ask-YesNo "是否重新输入（覆盖原值）？" "N") { $newKey = Read-ApiKey }
+    if (Ask-YesNo "是否重新输入（覆盖原值）？" "N") { $newKey = Resolve-KeyInput (Read-ApiKey) }
 } elseif ($env:DEEPSEEK_API_KEY) {
     Write-Ok ("系统环境变量中已有 Key：" + (Mask-Key $env:DEEPSEEK_API_KEY))
     Write-Note "系统环境变量优先级更高，可直接使用；下面的 .env 是可选的备份方式"
-    if (Ask-YesNo "是否同时写入项目 .env？" "N") { $newKey = Read-ApiKey }
+    if (Ask-YesNo "是否同时写入项目 .env？" "N") { $newKey = Resolve-KeyInput (Read-ApiKey) }
 } else {
-    Write-Note "Key 申请地址：https://platform.deepseek.com/api_keys"
-    Write-Note "直接回车可跳过：应用会进入【离线演示模式】，所有流程与审计日志依然可以完整体验"
-    $newKey = Read-ApiKey
-    if (-not $newKey) { Write-Warn2 "已跳过：未配置 Key，启动后为离线演示模式" }
+    Write-Note "Key 申请地址：https://platform.deepseek.com/api_keys（登录后点 Create API key）"
+    Write-Note "不想现在填也行：直接回车跳过，应用会进入【离线演示模式】，流程可完整体验"
+    $newKey = Resolve-KeyInput (Read-ApiKey)
+    if (-not $newKey) { Write-Warn2 "已跳过：未配置 Key，启动后为离线演示模式（想补填就重跑本脚本 ①）" }
 }
 
 if ($newKey) {
