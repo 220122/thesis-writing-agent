@@ -1,0 +1,10 @@
+# 本地数据与密钥
+data/
+.smoke_data/
+.run/
+.python_path
+.env
+.venv/
+.venv-test/
+__pycache__/
+*.pyc
