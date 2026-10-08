@@ -241,7 +241,7 @@ if ($newKey) {
     if ($newKey -notmatch '^sk-') { Write-Warn2 "该 Key 不以 sk- 开头，请确认没有复制错（应形如 sk-xxxxxxxx）" }
     Set-EnvKey -Path $envFile -Key $newKey
     Write-Ok ("已写入 .env：" + (Mask-Key $newKey))
-    Write-Note "该文件已在 .gitignore 中，④ 推送到 GitHub 时不会被上传"
+    Write-Note "该文件已在 .gitignore 中，不会被提交到 Git 仓库"
 }
 
 # ---------- 4/5 自检 ----------
