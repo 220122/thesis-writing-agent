@@ -552,6 +552,144 @@ def part_c():
 
 
 # =============================================================================
+# D. Word 导出 / AI 自动修订 / 问题定位 自检
+# =============================================================================
+
+MD_SAMPLE = """# 测试论文标题
+
+## 第1章 绪论
+
+### 1.1 研究背景
+
+正文段落，含**粗体**、*斜体*与引用[1]。
+
+- 列表项一
+- 列表项二
+
+1. 有序项一
+
+> ⚠️ 本章尚未批准
+
+## 参考文献
+
+[1] 张三. 测试[J]. 期刊, 2023, 1(1): 1-2.
+"""
+
+
+def part_d():
+    section("D. Word 导出 / AI 自动修订 / 问题定位")
+    import app as app_mod
+    import docx_export as dx
+    import zipfile
+    import io
+    import xml.etree.ElementTree as ET
+
+    # ---------- D1 解析 ----------
+    blocks = dx.parse_markdown_blocks(MD_SAMPLE)
+    kinds = [b[0] for b in blocks]
+    check("Markdown 块解析完整",
+          kinds.count("h") == 4 and "li" in kinds and "oli" in kinds and "quote" in kinds,
+          str(kinds))
+    check("内联粗体被识别",
+          dx._split_runs("a**b**c") == [("a", False, False, False), ("b", True, False, False),
+                                        ("c", False, False, False)])
+    check("Markdown 标记被剥离", "**" not in dx._strip_inline("含**粗体**的文字"))
+
+    # ---------- D2 两条导出路径 ----------
+    for label, flag in (("内置生成器", False), ("python-docx", True)):
+        if flag and not dx.has_python_docx():
+            print("  [SKIP] 未安装 python-docx，跳过该路径（程序会自动降级，功能不受影响）")
+            continue
+        orig = dx.has_python_docx
+        dx.has_python_docx = (lambda f=flag: f)
+        try:
+            data = dx.markdown_to_docx(MD_SAMPLE, "测试论文标题",
+                                       {"major": "教育技术学", "student": "测试同学"})
+        finally:
+            dx.has_python_docx = orig
+        z = zipfile.ZipFile(io.BytesIO(data))
+        xml_ok = True
+        try:
+            for name in z.namelist():
+                ET.fromstring(z.read(name).decode("utf-8"))
+        except Exception:
+            xml_ok = False
+        names = z.namelist()
+        check("%s：生成合法 .docx" % label,
+              xml_ok and "word/document.xml" in names and "[Content_Types].xml" in names,
+              "%d 字节 / %d 个部件" % (len(data), len(names)))
+        body_xml = z.read("word/document.xml").decode("utf-8")
+        check("%s：标题与正文都写入" % label,
+              "测试论文标题" in body_xml and "研究背景" in body_xml)
+        check("%s：没有裸露的 Markdown 星号" % label, "**" not in body_xml)
+
+    # ---------- D3 待补充清单拆分 ----------
+    body, todo = app_mod.split_todo_list("正文内容。\n\n---待补充清单---\n1. 有效问卷数\n2. 信度系数")
+    check("AI 修订稿的「待补充清单」可拆分",
+          "待补充" not in body and "有效问卷数" in todo, repr(todo[:24]))
+
+    # ---------- D4 审查意见定位 ----------
+    text = "第一段内容。\n\n第二段里包含 特殊证据片段ABC 在这里。\n\n第三段。"
+    pos = app_mod.locate_finding(text, {"evidence": "特殊证据片段ABC", "message": "测试"})
+    check("审查意见能定位到具体段落", "第 2 段" in pos, pos)
+
+    # ---------- D5 AI 自动修订（离线 mock，走完整 UI） ----------
+    try:
+        from streamlit.testing.v1 import AppTest
+    except ImportError:
+        print("  [SKIP] Streamlit 版本不支持 AppTest")
+        return
+
+    at = AppTest.from_file(APP_PATH, default_timeout=300)
+    at.run()
+    at.sidebar.text_input[0].set_value("短视频使用对大学生注意力的影响研究")
+    at.sidebar.text_input[1].set_value("教育技术学")
+    find_element(at.sidebar.button, "创建项目").click()
+    at.run()
+
+    ps = at.session_state["pstate"]
+    ps["outline"]["text"] = "## 第1章 绪论\n### 1.1 研究背景\n### 1.2 研究意义\n"
+    ps["outline"]["version"] = 1
+    ps["outline"]["status"] = "approved"
+    ps["references"] = "## 参考文献\n[1] 张三. 测试[J]. 期刊, 2023, 1(1): 1-2.\n"
+    ps["ref_records"] = [{"title": "测试文献", "authors": [{"family": "", "given": "", "name": "张三"}],
+                          "year": 2023, "venue": "期刊", "volume": "1", "issue": "1", "pages": "1-2",
+                          "doi": "10.1234/test.2023", "url": "", "type": "J", "source": "测试",
+                          "cited_by": 0, "abstract": ""}]
+    ps["chapters"] = [{"index": 1, "title": "第1章 绪论", "sections": ["研究背景", "研究意义"],
+                       "target_words": 1200, "text": "这是需要修订的旧稿内容，包含[9]这样的越界引用。",
+                       "version": 1, "status": "draft", "approved_at": "", "feedback": ""}]
+    ps["reviews"]["chapter_1"] = {
+        "version": 1, "ts": app_mod.now_ts(), "kind": "chapter", "target": "第1章 绪论",
+        "findings": [{"level": "BLOCKER", "category": "引用不存在", "message": "正文引用了不存在的[9]",
+                      "evidence": "包含[9]这样的越界引用", "suggestion": "删除该引用", "source": "规则引擎"}],
+        "llm_text": "", "summary": "", "blockers": 1, "warnings": 0,
+    }
+    at.run()
+    check("注入待修订章节后无异常", not at.exception, str(list(at.exception)))
+
+    find_element(at.button, "AI 自动修订本章").click()
+    at.run()
+    check("AI 自动修订执行无异常", not at.exception, str(list(at.exception)))
+    ps = at.session_state["pstate"]
+    ch1 = ps["chapters"][0]
+    check("修订后生成新版本", int(ch1.get("version", 0)) == 2, "v%s" % ch1.get("version"))
+    check("修订后旧审查结论已作废（必须重审）",
+          app_mod.get_review(ps, "chapter_1") is None)
+    check("修订稿已替换正文", "需要修订的旧稿" not in ch1.get("text", ""))
+    events = {r["event_type"] for r in app_mod.fetch_logs(ps["project_id"])}
+    check("审计日志记录 AI_REVISE 事件", "AI_REVISE" in events, str(sorted(events)))
+    rev = [r for r in app_mod.fetch_logs(ps["project_id"]) if r["event_type"] == "AI_REVISE"][0]
+    check("AI_REVISE 记录了修订依据与 diff",
+          "问题" in (rev["prompt"] or "") and ("+" in (rev["user_edit"] or "") or "-" in (rev["user_edit"] or "")))
+
+    # ---------- D6 Word 导出按钮存在 ----------
+    check("导出页提供 Word 下载按钮",
+          any("Word" in str(getattr(b, "label", "")) for b in at.download_button),
+          str([getattr(b, "label", "") for b in at.download_button])[:120])
+
+
+# =============================================================================
 # main
 # =============================================================================
 
@@ -561,6 +699,7 @@ def main():
         part_a()
         part_b()
         part_c()
+        part_d()
     finally:
         print("\n" + "=" * 78)
         print("自检结果：通过 %d 项，失败 %d 项" % (len(PASSED), len(FAILED)))

@@ -74,6 +74,10 @@ try:
     import literature as lit          # 真实文献检索（OpenAlex / Crossref，免费无 Key）
 except Exception:                      # pragma: no cover - 模块缺失时降级为手工录入
     lit = None
+try:
+    import docx_export as docxexp     # Word（.docx）导出
+except Exception:                      # pragma: no cover
+    docxexp = None
 
 # ---- 尽早加载项目根目录的 .env（若安装了 python-dotenv）----
 #   ① 首次安装脚本会把 DEEPSEEK_API_KEY 写进 .env；
@@ -1470,6 +1474,68 @@ class WriterAgent(BaseAgent):
                            task="chapter", mock_payload=mock)
 
 
+    def revise_by_findings(self, meta: Dict[str, Any], outline_text: str, chapter: Dict[str, Any],
+                           findings: Sequence[Dict[str, Any]], references: str = "",
+                           include_warnings: bool = True,
+                           extra: str = "") -> Generator[str, None, None]:
+        """
+        按合规审查意见自动修订本章（HITL 的「AI 帮我改」入口）。
+
+        铁律：**绝不编造数据与文献**。凡必须依赖学生本人真实数据才能解决的问题，
+        只插入【待你补充：…】占位标记并列出清单，绝不用假数字填坑。
+        """
+        picked = [f for f in findings
+                  if f.get("level") == LEVEL_BLOCKER or (include_warnings and f.get("level") == LEVEL_WARNING)]
+        issues = "\n".join(
+            "%d. [%s][%s] %s ｜ 证据：%s ｜ 建议：%s"
+            % (i + 1, f.get("level"), f.get("category", ""), f.get("message", ""),
+               short(f.get("evidence", "") or "未给出", 60), f.get("suggestion", "") or "未给出")
+            for i, f in enumerate(picked)
+        ) or "（没有需要修订的问题）"
+
+        heading = chapter_display_title(chapter)
+        prompt = (
+            "下面是一篇本科毕业论文的章节初稿，以及合规审查发现的问题清单。"
+            "请你**逐条修订**，输出修订后的完整章节。\n\n"
+            "【本次要修订的章节】%s\n"
+            "【需覆盖的小节】\n%s\n\n"
+            "【修订铁律（必须严格遵守）】\n"
+            "1. 严禁编造任何数据、统计量、文献、作者、期刊、DOI。文献只能引用我提供的编号。\n"
+            "2. 凡是必须依赖「学生本人的真实数据/实验结果」才能解决的问题"
+            "（例如缺少问卷发放量、样本量、信度系数 Cronbach's α、t/F/β/p 值、R²），"
+            "你**绝对不得编造数字**：请把这部分改写为不含虚假数字的表述，"
+            "并在需要填数的地方插入占位标记，形如【待你补充：有效问卷数】。\n"
+            "3. 其余问题（过度断言、模糊归因、逻辑前后不一致、术语不统一、结构错位、"
+            "引用标注格式、与大纲不符）必须真正修改到位，不能只加一句“已修改”。\n"
+            "4. 保持与大纲一致的标题层级（'## 第N章 …'、'### N.M …'）。\n"
+            "5. 输出**完整章节正文**（不要省略任何小节，不要只给修改片段）。\n"
+            "6. 修改完成后，在正文最后另起一行输出 '---待补充清单---'，"
+            "然后用简短列表逐条说明学生需要自己填写/核实的内容；若无需补充则写“无”。\n"
+            "7. 直接输出 Markdown，不要任何开场白或解释。\n\n"
+            "【可用参考文献（只能引用这些编号）】\n%s\n\n"
+            "【审查问题清单】\n%s\n\n"
+            "【原文】\n%s\n\n"
+            "现在输出修订后的完整章节。"
+            % (
+                heading,
+                "\n".join("- " + s for s in (chapter.get("sections") or ["（按大纲）"])),
+                references or "（暂无参考文献可用，此时不要添加任何引用标注）",
+                issues,
+                chapter.get("text", ""),
+            )
+        )
+        if extra:
+            prompt += "\n【学生附加要求】\n%s\n" % extra
+        mock = {
+            "title": meta.get("title"), "major": meta.get("major"),
+            "chapter_index": chapter["index"], "chapter_title": heading,
+            "target_words": chapter.get("target_words", 1200),
+            "sections": chapter.get("sections") or [],
+        }
+        return self.stream(prompt, temperature=0.4, max_tokens=MAX_TOKENS_CHAPTER,
+                           task="chapter", mock_payload=mock)
+
+
 class ComplianceAgent(BaseAgent):
     """
     合规审查员 Agent：本地规则引擎 + 大模型深度审查 双层结构。
@@ -1804,7 +1870,35 @@ def require_project() -> Optional[Dict[str, Any]]:
 # 十、UI 组件与页面
 # =============================================================================
 
-def render_findings(findings: Sequence[Dict[str, Any]], title: str = "合规审查结论") -> None:
+def locate_finding(text: str, finding: Dict[str, Any]) -> str:
+    """
+    尽量把审查意见定位到原文的哪一段，解决“知道有问题但不知道改哪”。
+    用证据片段在正文里做归一化匹配（忽略空白与 Markdown 标记）。
+    """
+    if not text:
+        return ""
+    ev = (finding.get("evidence") or "").strip()
+
+    def norm(s: str) -> str:
+        return re.sub(r"[\s`*#>\[\]（）()，,。.、；;：:「」“”\"']", "", s or "")
+
+    paras = [p for p in re.split(r"\n\s*\n", text) if p.strip()]
+    probe = norm(ev)[:18]
+    if probe:
+        for i, p in enumerate(paras):
+            if probe in norm(p):
+                first_line = p.strip().splitlines()[0].strip()
+                return "位置：第 %d 段 %s" % (i + 1, short(first_line, 34))
+    # 证据太短或找不到 → 用关键词再试一次
+    for kw in re.findall(r"[\u4e00-\u9fff]{6,12}", ev or finding.get("message") or "")[:3]:
+        for i, p in enumerate(paras):
+            if kw in p:
+                return "位置：可能在 第 %d 段（关键词「%s」）" % (i + 1, kw)
+    return "位置：整体性问题，未定位到具体段落"
+
+
+def render_findings(findings: Sequence[Dict[str, Any]], title: str = "合规审查结论",
+                    source_text: str = "") -> None:
     if not findings:
         st.success("✅ 未发现合规问题（本地规则引擎已全部通过）。")
         return
@@ -1819,6 +1913,10 @@ def render_findings(findings: Sequence[Dict[str, Any]], title: str = "合规审�
         text = "%s **[%s] %s** — %s" % (
             LEVEL_ICON.get(f["level"], "•"), f["level"], f.get("category", ""), f.get("message", "")
         )
+        if source_text:
+            loc = locate_finding(source_text, f)
+            if loc:
+                text += "\n\n&nbsp;&nbsp;&nbsp;&nbsp;↳ %s" % loc
         if f.get("evidence"):
             text += "\n\n&nbsp;&nbsp;&nbsp;&nbsp;↳ 证据：`%s`" % short(str(f["evidence"]), 120)
         if f.get("suggestion"):
@@ -1916,6 +2014,75 @@ def run_compliance_check(ps: Dict[str, Any], *, target_key: str, text: str, kind
           detail={"findings": findings, "summary": summary, "blockers": review["blockers"]})
     persist(ps)
     return review
+
+
+# ------------------------------ AI 自动修订 ------------------------------
+
+_TODO_SPLIT_RE = re.compile(r"^\s*-{2,}\s*待补充清单\s*-{2,}\s*$", re.M)
+
+
+def split_todo_list(text: str) -> Tuple[str, str]:
+    """把 AI 修订稿末尾的「---待补充清单---」拆出来（正文 / 清单分开存）。"""
+    m = _TODO_SPLIT_RE.search(text or "")
+    if not m:
+        return (text or "").strip(), ""
+    return (text[:m.start()]).strip(), (text[m.end():]).strip()
+
+
+def ai_revise_chapter(ps: Dict[str, Any], chapter: Dict[str, Any],
+                      findings: Sequence[Dict[str, Any]], include_warnings: bool = True) -> bool:
+    """
+    让 AI 按审查意见自动修订一章（供「本人点一下」和「批量修订」共用）。
+    成功返回 True。原稿会保留在稿件版本历史里。
+    """
+    meta = ps["meta"]
+    rv = get_review(ps, "chapter_%d" % chapter["index"]) or {}
+    agent = WriterAgent(SS["llm"])
+    version = int(chapter.get("version", 0))
+    picked = [f for f in findings
+              if f.get("level") == LEVEL_BLOCKER or (include_warnings and f.get("level") == LEVEL_WARNING)]
+    st.markdown("**第%d章修订依据**：共 %d 条（🛑 %d / ⚠️ %d）"
+                % (chapter["index"], len(picked),
+                   sum(1 for f in picked if f["level"] == LEVEL_BLOCKER),
+                   sum(1 for f in picked if f["level"] == LEVEL_WARNING)))
+    new_text = stream_to_ui(
+        agent.revise_by_findings(meta, ps["outline"].get("text", ""), chapter, findings,
+                                 references=reference_records_block(ps),
+                                 include_warnings=include_warnings),
+        label="🪄 正在按审查意见修订第%d章…" % chapter["index"])
+    if not new_text:
+        return False
+
+    body, todo = split_todo_list(new_text)
+    diff = unified_diff(chapter.get("text", ""), body,
+                        "第%d章 v%d → AI修订版" % (chapter["index"], version))
+    chapter["text"] = body
+    chapter["todo_list"] = todo
+    chapter["version"] = version + 1
+    chapter["status"] = "draft"
+    ps["reviews"].pop("chapter_%d" % chapter["index"], None)   # 正文变了，旧审查结论作废
+    save_artifact(ps["project_id"], "chapter", chapter["index"], chapter["version"],
+                  "draft", body, note="AI 按审查意见修订")
+    audit(actor=WriterAgent.name, actor_role="AGENT", event_type="AI_REVISE",
+          stage="chapter", target="chapter_%d" % chapter["index"],
+          prompt="revise_by_findings｜依据 %d 条问题（含警告 %s）" % (len(picked), include_warnings),
+          ai_output=body, user_edit=diff, status="draft",
+          detail={"from_version": version, "to_version": chapter["version"],
+                  "issues": [short(f.get("message", ""), 50) for f in picked[:12]],
+                  "todo": short(todo, 300), "mode": ps.get("mode", "hitl")})
+    push_history(ps, "AI 按审查意见修订第%d章 → v%d" % (chapter["index"], chapter["version"]))
+    persist(ps)
+    return True
+
+
+def render_todo_list(chapter: Dict[str, Any]) -> None:
+    todo = (chapter.get("todo_list") or "").strip()
+    if not todo:
+        return
+    with st.expander("📌 AI 列出的「需要你自己填写/核实」清单", expanded=True):
+        st.markdown(todo)
+        st.caption("这些内容涉及你自己的问卷/实验数据，AI 不会替你编造，"
+                   "填完后请重新运行合规审查——在那之前本章仍会被阻断，这是刻意设计。")
 
 
 # ------------------------------ 侧边栏 ------------------------------
@@ -2423,15 +2590,39 @@ def render_writer_tab(ps: Dict[str, Any]) -> None:
         _rerun()
 
     rv = get_review(ps, "chapter_%d" % chapter["index"])
+    fresh = False
     if rv:
-        if not review_is_fresh(ps, "chapter_%d" % chapter["index"], version):
+        fresh = review_is_fresh(ps, "chapter_%d" % chapter["index"], version)
+        if not fresh:
             st.warning("⚠️ 审查结论已过期（本章在审查后被修改），请重新运行合规审查。")
         render_findings(rv.get("findings", []),
-                        title="第%d章审查结论（%s）" % (chapter["index"], rv["ts"]))
+                        title="第%d章审查结论（%s）" % (chapter["index"], rv["ts"]),
+                        source_text=chapter["text"])
         if rv.get("summary"):
             st.info("模型总体结论：%s" % rv["summary"])
     else:
         st.caption("本章尚未执行合规审查。")
+
+    render_todo_list(chapter)
+
+    # ---- 🪄 AI 自动修订（HITL 的「让 AI 帮我改」入口）----
+    if fresh and rv and rv.get("findings"):
+        st.divider()
+        st.markdown("#### 🪄 让 AI 按审查意见自动修订")
+        st.caption(
+            "AI 会真正改掉**表述、结构、逻辑、术语、引用格式**这类问题；"
+            "凡涉及**你自己问卷/实验数据**的（样本量、信度系数、t/F/β/p 值等），"
+            "它**不会编造数字**，只会插入 `【待你补充：…】` 占位标记，并把清单列出来——"
+            "在那之前本章仍会被阻断，这是刻意设计。原稿会保留在稿件版本历史中。"
+        )
+        inc_warn = st.checkbox("连同 ⚠️ 警告一起修（推荐）", value=True,
+                               key="revise_warn_%d" % chapter["index"])
+        if st.button("🪄 AI 自动修订本章", type="primary", use_container_width=True,
+                     key="revise_btn_%d" % chapter["index"]):
+            if ai_revise_chapter(ps, chapter, rv.get("findings", []), include_warnings=inc_warn):
+                st.success("已生成修订版 v%d，请重新运行合规审查确认问题是否解决。"
+                           % chapter.get("version"))
+                _rerun()
 
     # ---- 批准 ----
     st.divider()
@@ -2525,7 +2716,41 @@ def render_compliance_tab(ps: Dict[str, Any]) -> None:
             _rerun()
     rv = get_review(ps, "document")
     if rv:
-        render_findings(rv.get("findings", []), title="全篇检查结论（%s）" % rv["ts"])
+        render_findings(rv.get("findings", []), title="全篇检查结论（%s）" % rv["ts"],
+                        source_text=build_full_document(ps))
+
+    st.divider()
+    st.markdown("#### 🪄 批量自动修订（按各章审查意见）")
+    st.caption("不知道从哪改起时，让 AI 按每章的审查意见自动改一遍；"
+               "涉及你自己数据的地方它会插占位标记，不会编数字。")
+    pending: List[Tuple[Dict[str, Any], Dict[str, Any], int, int]] = []
+    for ch in ps["chapters"]:
+        rv2 = get_review(ps, "chapter_%d" % ch["index"])
+        if not rv2:
+            continue
+        if not review_is_fresh(ps, "chapter_%d" % ch["index"], int(ch.get("version", 0))):
+            continue
+        nb = sum(1 for f in rv2.get("findings", []) if f["level"] == LEVEL_BLOCKER)
+        nw = sum(1 for f in rv2.get("findings", []) if f["level"] == LEVEL_WARNING)
+        if nb or nw:
+            pending.append((ch, rv2, nb, nw))
+
+    if not pending:
+        st.caption("没有待修订的章节（要么还没审查，要么已经没有问题）。")
+    else:
+        for ch, rv2, nb, nw in pending:
+            st.markdown("- 第%d章 %s：🛑 阻断 %d ／ ⚠️ 警告 %d" % (ch["index"], ch["title"], nb, nw))
+        inc_warn2 = st.checkbox("连同 ⚠️ 警告一起修（推荐）", value=True, key="batch_revise_warn")
+        if st.button("🪄 批量修订以上 %d 个章节" % len(pending), type="primary",
+                     use_container_width=True):
+            ok = 0
+            for ch, rv2, nb, nw in pending:
+                with st.expander("修订 第%d章 %s" % (ch["index"], ch["title"]), expanded=True):
+                    if ai_revise_chapter(ps, ch, rv2.get("findings", []),
+                                         include_warnings=inc_warn2):
+                        ok += 1
+            st.success("已修订 %d 章，请到各章重新运行合规审查确认问题是否解决。" % ok)
+            _rerun()
 
     st.divider()
     st.markdown("#### ④ 全局自查重（跨章节 / 自定义比对源）")
@@ -2998,7 +3223,8 @@ def run_auto_pipeline(ps: Dict[str, Any], *, want_refs: int, use_review: bool) -
                       prompt="一键模式自动审查", ai_output=review_text,
                       status="blocked" if ps["reviews"]["chapter_%d" % ch["index"]]["blockers"] else "passed",
                       detail={"findings": findings, "mode": "auto"})
-                render_findings(findings, title="第%d章自动审查结论" % ch["index"])
+                render_findings(findings, title="第%d章自动审查结论" % ch["index"],
+                                source_text=ch.get("text", ""))
                 persist(ps)
 
     step("汇编与收尾")
@@ -3208,9 +3434,33 @@ def render_export_tab(ps: Dict[str, Any]) -> None:
     doc = build_full_document(ps)
     st.caption("定稿字数约 %d 字（目标 %s 字）" % (count_words(doc), ps["meta"].get("target_words")))
 
+    safe_title = re.sub(r'[\\/:*?"<>|]', "_", (ps["meta"].get("title") or "论文"))[:40]
+
+    # ---- Word 导出 ----
+    st.markdown("#### 📄 导出为 Word 文档")
+    docx_bytes = None
+    if docxexp is not None:
+        try:
+            docx_bytes = docxexp.markdown_to_docx(doc, title=ps["meta"].get("title", ""),
+                                                 meta=ps["meta"])
+        except Exception as exc:
+            st.warning("Word 生成失败（可改用 Markdown 导出后在 Word 里打开）：%s" % exc)
+    if docx_bytes:
+        engine = "python-docx（带标题层级，可在 Word 里直接生成目录）" if docxexp.has_python_docx() \
+            else "内置生成器（未安装 python-docx，已自动降级，Word/WPS 均可打开）"
+        st.caption("生成引擎：%s ｜ 中文排版：正文宋体小四 / 1.5 倍行距 / 首行缩进 2 字符，标题黑体"
+                   % engine)
+        st.download_button("⬇️ 下载 Word 文档（.docx）", docx_bytes,
+                           file_name="%s.docx" % safe_title,
+                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                           type="primary", use_container_width=True)
+    else:
+        st.caption("Word 导出暂不可用，请用下面的 Markdown 导出（Word 可直接打开 .md 另存为 .docx）。")
+
+    st.markdown("#### 📦 其它导出")
     c1, c2, c3 = st.columns(3)
     c1.download_button("⬇️ 论文全文（Markdown）", doc.encode("utf-8"),
-                       file_name="%s.md" % ps["meta"].get("title", "thesis")[:30],
+                       file_name="%s.md" % safe_title,
                        mime="text/markdown", use_container_width=True)
     c2.download_button("⬇️ 项目进度快照（JSON）",
                        json.dumps(ps, ensure_ascii=False, indent=2).encode("utf-8"),
@@ -3231,7 +3481,7 @@ def render_export_tab(ps: Dict[str, Any]) -> None:
 
     with st.expander("📜 学术诚信声明（请阅读）"):
         st.markdown(
-            "1. 本系统为**写作辅助工具**，不提供一键成文服务，所有内容必须经作者本人核对与修改。\n"
+            "1. 本系统为**写作辅助工具**，AI 生成内容必须经作者本人核对、修改后使用。\n"
             "2. 系统内的合规检查基于规则与模型启发式判断，**不能替代**学校指定的查重系统与导师审核。\n"
             "3. 引用他人观点必须规范标注，禁止编造文献、数据与实验结果。\n"
             "4. 全部操作已记录在审计日志中，可随时导出备查。\n"
